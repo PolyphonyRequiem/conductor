@@ -101,12 +101,21 @@ jobs:
       - name: Install dependencies
         run: uv sync --group dev
 
+      - name: Remove bundled Copilot CLI binary
+        run: |
+          # The github-copilot-sdk >=0.1.23 bundles a CLI binary that tries to
+          # authenticate with GitHub on startup. Remove it so tests that invoke
+          # the real CLI path fail fast instead of hanging on auth.
+          find .venv -path '*/copilot/bin/copilot*' -delete 2>/dev/null || true
+
       - name: Run tests with coverage
-        run: uv run pytest --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api"
+        timeout-minutes: 10
+        run: uv run pytest --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not performance"
         env:
           # Fake API key for mock tests to prevent accidental real API calls.
           # Real API tests (marked with @pytest.mark.real_api) are excluded from CI
-          # via the '-m "not real_api"' filter and must be run manually with valid key.
+          # via the marker filter. Performance tests are also excluded as they
+          # contain timing-sensitive assertions that are flaky on shared CI runners.
           # This ensures CI tests are fast, free, and don't leak credentials.
           ANTHROPIC_API_KEY: "sk-ant-test-fake-key-for-mocking"
 
