@@ -166,7 +166,7 @@ interface WorkflowState {
   workflowName: string;
   workflowStatus: WorkflowStatus;
   workflowStartTime: number | null;
-  workflowFailure: { error_type?: string; message?: string } | null;
+  workflowFailure: { error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; checkpoint_path?: string } | null;
   workflowFailedAgent: string | null;
   entryPoint: string | null;
 
@@ -197,6 +197,7 @@ interface WorkflowState {
   eventLog: LogEntry[];
   activityLog: ActivityLogEntry[];
   workflowOutput: unknown | null;
+  lastEventTime: number | null;
 
   // Actions
   processEvent: (event: WorkflowEvent) => void;
@@ -267,6 +268,7 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
   eventLog: [],
   activityLog: [],
   workflowOutput: null,
+  lastEventTime: null,
   _wsSend: null,
 
   setWsSend: (fn) => {
@@ -287,21 +289,21 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
 
   processEvent: (event: WorkflowEvent) => {
     const handler = eventHandlers[event.type];
-    if (handler) {
-      set((state) => {
-        const newState = { ...state, nodes: { ...state.nodes }, groupProgress: { ...state.groupProgress }, eventLog: [...state.eventLog], activityLog: [...state.activityLog] };
+    set((state) => {
+      const newState = { ...state, nodes: { ...state.nodes }, groupProgress: { ...state.groupProgress }, eventLog: [...state.eventLog], activityLog: [...state.activityLog], lastEventTime: event.timestamp };
+      if (handler) {
         handler(newState, event.data);
-        const logEntry = buildLogEntry(event);
-        if (logEntry) {
-          newState.eventLog.push(logEntry);
-        }
-        const activityEntry = buildActivityLogEntry(event);
-        if (activityEntry) {
-          newState.activityLog.push(activityEntry);
-        }
-        return newState;
-      });
-    }
+      }
+      const logEntry = buildLogEntry(event);
+      if (logEntry) {
+        newState.eventLog.push(logEntry);
+      }
+      const activityEntry = buildActivityLogEntry(event);
+      if (activityEntry) {
+        newState.activityLog.push(activityEntry);
+      }
+      return newState;
+    });
   },
 
   replayState: (events: WorkflowEvent[]) => {
@@ -793,7 +795,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
   },
 
   workflow_failed: (state, _data) => {
-    const data = _data as { agent_name?: string; error_type?: string; message?: string };
+    const data = _data as { agent_name?: string; error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string };
     state.workflowStatus = 'failed';
     state.workflowFailedAgent = data.agent_name || null;
     if (data.agent_name && state.nodes[data.agent_name]) {
@@ -811,10 +813,17 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         }
       }
     }
-    state.workflowFailure = { error_type: data.error_type, message: data.message };
+    state.workflowFailure = { error_type: data.error_type, message: data.message, elapsed_seconds: data.elapsed_seconds, timeout_seconds: data.timeout_seconds, current_agent: data.current_agent };
     if (state.nodes['$start']) {
       state.nodes['$start']!.status = 'completed';
       replaceNode(state.nodes, '$start');
+    }
+  },
+
+  checkpoint_saved: (state, _data) => {
+    const data = _data as { path?: string };
+    if (data.path && state.workflowFailure) {
+      state.workflowFailure = { ...state.workflowFailure, checkpoint_path: data.path };
     }
   },
 };
@@ -886,6 +895,9 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
 
     case 'workflow_failed':
       return { timestamp: ts, level: 'error', source: 'workflow', message: `Workflow failed: ${d.message || d.error_type || 'unknown error'}` };
+
+    case 'checkpoint_saved':
+      return { timestamp: ts, level: 'info', source: 'workflow', message: `Checkpoint saved: ${(d.path as string)?.split('/').pop() || 'unknown'}` };
 
     // Skip high-frequency streaming events from the log
     default:
