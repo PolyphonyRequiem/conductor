@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import json
 import logging
 import time as _time
 from dataclasses import dataclass, field
@@ -687,12 +688,20 @@ class WorkflowEngine:
             suggestion="Check the option values in the workflow YAML",
         )
 
+    # ------------------------------------------------------------------
+    # Interrupt support
+    # ------------------------------------------------------------------
+
     async def _check_interrupt(self, current_agent_name: str) -> InterruptResult | None:
         """Check for a pending interrupt and handle it if present.
 
         If the interrupt event is set, clears it, builds an output preview
         from the last stored output, and delegates to the InterruptHandler
         for user interaction.
+
+        In web mode (dashboard connected), the interrupt is consumed
+        silently — the provider-level racing handles the actual pause/resume
+        flow, so the between-agent check just needs to clear the stale flag.
 
         Args:
             current_agent_name: Name of the agent that just completed
@@ -706,9 +715,15 @@ class WorkflowEngine:
 
         self._interrupt_event.clear()
 
-        # Build output preview from last stored output
-        import json
+        # In web mode, the interrupt was already handled at the provider level
+        # (partial output → _handle_web_pause). Consume the stale flag silently.
+        # We check for dashboard presence only (not has_connections) because in
+        # --web/--web-bg mode the CLI interactive handler is never appropriate,
+        # even if clients are transiently disconnected.
+        if self._web_dashboard is not None:
+            return None
 
+        # Build output preview from last stored output
         last_output = self.context.get_latest_output()
         last_output_preview: str | None = None
         if last_output is not None:
@@ -760,6 +775,92 @@ class WorkflowEngine:
             case InterruptAction.CANCEL:
                 return current_agent_name
 
+    async def _handle_web_pause(self, agent_name: str, partial_output: AgentOutput) -> bool:
+        """Handle a mid-agent interrupt when the web dashboard is connected.
+
+        Emits an ``agent_paused`` event and waits for the user to click
+        Resume or Kill in the dashboard.  If all browser clients disconnect
+        while waiting, auto-resumes to avoid hanging the workflow.
+
+        Args:
+            agent_name: The name of the interrupted agent.
+            partial_output: The partial output from the interrupted agent.
+
+        Returns:
+            True if the agent should be re-executed (Resume chosen or
+            all clients disconnected), False if no web dashboard is
+            connected (caller should invoke ``_handle_partial_output``).
+
+        Raises:
+            InterruptError: If the user chose Kill (``POST /api/kill``).
+        """
+        if self._web_dashboard is None or not self._web_dashboard.has_connections():
+            return False
+
+        try:
+            preview = json.dumps(partial_output.content, indent=2, default=str)[:500]
+        except (TypeError, ValueError):
+            preview = str(partial_output.content)[:500]
+
+        self._emit(
+            "agent_paused",
+            {"agent_name": agent_name, "partial_content": preview},
+        )
+        logger.info("Agent '%s' paused — waiting for dashboard resume", agent_name)
+
+        resume_event = self._web_dashboard.resume_event
+        kill_event = self._web_dashboard.kill_event
+        disconnect_event = self._web_dashboard.disconnect_event
+
+        # Clear stale signals from prior pause cycles, then create wait tasks.
+        # We must check is_set() after creating tasks to close the race window
+        # where an HTTP handler sets the event between clear() and wait().
+        resume_event.clear()
+        kill_event.clear()
+        disconnect_event.clear()
+
+        resume_task = asyncio.create_task(resume_event.wait())
+        kill_task = asyncio.create_task(kill_event.wait())
+        disconnect_task = asyncio.create_task(disconnect_event.wait())
+        tasks = {resume_task, kill_task, disconnect_task}
+
+        # If any event was set between clear() and task creation, the task
+        # will already be done — no need to wait, but we still fall through
+        # to the normal done/pending handling below.
+        try:
+            done, pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
+        except Exception:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await t
+            raise
+
+        if kill_task in done:
+            raise InterruptError(agent_name=agent_name)
+
+        if disconnect_task in done:
+            logger.info(
+                "All dashboard clients disconnected while '%s' was paused — auto-resuming",
+                agent_name,
+            )
+
+        # Clear resume_event after consumption so a stale signal from a
+        # double-click or prior API call doesn't skip the next legitimate pause.
+        resume_event.clear()
+
+        self._emit("agent_resumed", {"agent_name": agent_name})
+        logger.info("Agent '%s' resumed — re-executing", agent_name)
+        return True
+
     async def _handle_partial_output(
         self,
         agent: AgentDef,
@@ -786,17 +887,15 @@ class WorkflowEngine:
         Returns:
             The final (non-partial) AgentOutput after handling the interrupt.
         """
-        import json as _json
-
         from conductor.providers.copilot import CopilotProvider
 
         # Build preview from partial output
         try:
-            preview = _json.dumps(partial_output.content, indent=2, default=str)[:500]
+            preview = json.dumps(partial_output.content, indent=2, default=str)[:500]
         except (TypeError, ValueError):
             preview = str(partial_output.content)[:500]
 
-        # Invoke the interrupt handler
+        # CLI mode: invoke interactive interrupt handler
         interrupt_result = await self._interrupt_handler.handle_interrupt(
             current_agent=agent.name,
             iteration=self.context.current_iteration,
@@ -1271,6 +1370,24 @@ class WorkflowEngine:
 
                         # Handle mid-agent interrupt (partial output)
                         if output.partial:
+                            if await self._handle_web_pause(agent.name, output):
+                                # Web mode: agent paused then resumed → re-execute.
+                                # Clear interrupt_event to prevent the re-executed agent
+                                # from seeing the stale signal and returning partial again.
+                                if self._interrupt_event is not None:
+                                    self._interrupt_event.clear()
+                                continue
+                            # In web mode with no connections, auto-resume rather than
+                            # falling through to the CLI interactive handler (which would
+                            # block on stdin with no tty in --web-bg mode).
+                            if self._web_dashboard is not None:
+                                logger.info(
+                                    "No dashboard connections for '%s' — auto-resuming",
+                                    agent.name,
+                                )
+                                if self._interrupt_event is not None:
+                                    self._interrupt_event.clear()
+                                continue
                             output = await self._handle_partial_output(
                                 agent,
                                 output,
@@ -1767,10 +1884,8 @@ class WorkflowEngine:
 
         # Handle JSON string inputs (CLI passes arrays as strings)
         if isinstance(current, str):
-            import json as _json
-
             try:
-                parsed = _json.loads(current)
+                parsed = json.loads(current)
             except (ValueError, TypeError):
                 raise ExecutionError(
                     f"Source '{source}' resolved to a string that is not valid JSON: {current!r}",
@@ -2597,8 +2712,6 @@ class WorkflowEngine:
         Returns:
             Parsed JSON value if successful, original string otherwise.
         """
-        import json
-
         stripped = value.strip()
         if stripped.startswith(("{", "[", '"')) or stripped in ("true", "false", "null"):
             try:

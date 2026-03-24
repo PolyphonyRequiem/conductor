@@ -34,7 +34,9 @@ export type EventType =
   | 'for_each_completed'
   | 'workflow_completed'
   | 'workflow_failed'
-  | 'checkpoint_saved';
+  | 'checkpoint_saved'
+  | 'agent_paused'
+  | 'agent_resumed';
 
 // --- Workflow lifecycle ---
 
@@ -237,4 +239,15 @@ export interface ForEachCompletedData {
   elapsed?: number;
   success_count?: number;
   failure_count?: number;
+}
+
+// --- Pause/Resume ---
+
+export interface AgentPausedData {
+  agent_name: string;
+  partial_content?: string;
+}
+
+export interface AgentResumedData {
+  agent_name: string;
 }

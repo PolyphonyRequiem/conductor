@@ -19,6 +19,7 @@ This distinction ensures clear error classification and appropriate retry behavi
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import random
@@ -995,7 +996,66 @@ class ClaudeProvider(AgentProvider):
                 except Exception:
                     logger.debug("Error in event_callback for awaiting_model", exc_info=True)
 
-            if has_output_schema:
+            # Race API call against interrupt signal so user can abort
+            # a long-running API call (not just between iterations).
+            # Applied to both structured-output and regular paths for
+            # provider parity.
+            if interrupt_signal is not None:
+                if has_output_schema:
+                    api_task = asyncio.create_task(
+                        self._execute_with_parse_recovery(
+                            messages=working_messages,
+                            model=model,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            tools=tools,
+                            output_schema=output_schema,
+                        )
+                    )
+                else:
+                    api_task = asyncio.create_task(
+                        self._execute_api_call(
+                            messages=working_messages,
+                            model=model,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            tools=tools,
+                        )
+                    )
+                interrupt_task = asyncio.create_task(interrupt_signal.wait())
+                try:
+                    finished, pending = await asyncio.wait(
+                        {api_task, interrupt_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for t in pending:
+                        t.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await t
+                except Exception:
+                    for t in (api_task, interrupt_task):
+                        if not t.done():
+                            t.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await t
+                    raise
+
+                if interrupt_task in finished:
+                    logger.info("Mid-agent interrupt during Claude API call")
+                    interrupt_signal.clear()
+                    partial_resp, partial_tokens = await self._request_partial_output(
+                        working_messages=working_messages,
+                        model=model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        has_output_schema=has_output_schema,
+                    )
+                    total_tokens += partial_tokens
+                    return partial_resp, total_tokens, True
+
+                response = await api_task
+            elif has_output_schema:
                 response = await self._execute_with_parse_recovery(
                     messages=working_messages,
                     model=model,
@@ -1197,8 +1257,11 @@ class ClaudeProvider(AgentProvider):
         its best partial result. If ``emit_output`` is not available (no
         output schema), asks for a text summary instead.
 
+        Uses a copy of ``working_messages`` so the caller's history is
+        not mutated by the interrupt prompt.
+
         Args:
-            working_messages: Current message history (will be extended).
+            working_messages: Current message history (not modified).
             model: Model identifier.
             temperature: Temperature setting.
             max_tokens: Maximum output tokens.
@@ -1221,10 +1284,11 @@ class ClaudeProvider(AgentProvider):
                 "Return whatever you have, even if incomplete."
             )
 
-        working_messages.append({"role": "user", "content": interrupt_prompt})
+        messages_copy = list(working_messages)
+        messages_copy.append({"role": "user", "content": interrupt_prompt})
 
         response = await self._execute_api_call(
-            messages=working_messages,
+            messages=messages_copy,
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,

@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import random
 import time
 from collections.abc import Callable
@@ -40,12 +41,13 @@ _IDLE_IGNORED_EVENTS: frozenset[str] = frozenset(
 
 # Try to import the Copilot SDK
 try:
-    from copilot import CopilotClient
+    from copilot import CopilotClient, PermissionHandler
 
     COPILOT_SDK_AVAILABLE = True
 except ImportError:
     COPILOT_SDK_AVAILABLE = False
     CopilotClient = None  # type: ignore[misc, assignment]
+    PermissionHandler = None  # type: ignore[misc, assignment]
 
 
 @dataclass
@@ -86,8 +88,8 @@ class IdleRecoveryConfig:
             Use {last_activity} placeholder for context about what was happening.
     """
 
-    idle_timeout_seconds: float = 300.0  # 5 minutes
-    max_recovery_attempts: int = 3
+    idle_timeout_seconds: float = 90.0  # 90 seconds
+    max_recovery_attempts: int = 5
     max_session_seconds: float = 1800.0  # 30 minutes
     recovery_prompt: str = (
         "It appears you may have gotten stuck or stopped responding. "
@@ -187,17 +189,19 @@ class CopilotProvider(AgentProvider):
 
     @staticmethod
     def _default_permission_handler(
-        request: dict[str, Any],
+        request: Any,
         invocation: dict[str, str],
-    ) -> dict[str, Any]:
+    ) -> Any:
         """Default permission handler that approves all requests.
 
-        SDK v0.1.28+ requires a permission handler on session creation.
+        The SDK requires a permission handler on session creation.
         In orchestration mode, we approve all tool permissions since the
         workflow author controls which tools are available to each agent.
+
+        Returns a PermissionRequestResult from the SDK.
         """
         logger.debug("auto-approved permission request: %s", request)
-        return {"kind": "approved"}
+        return PermissionHandler.approve_all(request, invocation)
 
     async def execute(
         self,
@@ -443,19 +447,26 @@ class CopilotProvider(AgentProvider):
             )
 
         try:
-            # Build session config with MCP servers from workflow configuration
-            session_config: dict[str, Any] = {
+            # Build session kwargs for the SDK
+            session_kwargs: dict[str, Any] = {
                 "model": model,
                 "on_permission_request": self._default_permission_handler,
+                "working_directory": os.getcwd(),
             }
 
-            # Add temperature if configured
+            # Note: Copilot SDK >=0.2.0 does not support temperature as a
+            # session parameter. If a temperature was configured, log a warning
+            # so the user knows it's being ignored (provider parity with Claude).
             if self._temperature is not None:
-                session_config["temperature"] = self._temperature
+                logger.warning(
+                    "Copilot SDK does not support 'temperature' as a session parameter; "
+                    "ignoring configured value %.2f",
+                    self._temperature,
+                )
 
             # Add MCP servers if configured
             if self._mcp_servers:
-                session_config["mcp_servers"] = self._mcp_servers
+                session_kwargs["mcp_servers"] = self._mcp_servers
 
             # Attempt to resume a previous session if one exists for this agent
             session: Any = None
@@ -464,7 +475,7 @@ class CopilotProvider(AgentProvider):
                 try:
                     session = await self._client.resume_session(
                         resume_sid,
-                        {"on_permission_request": self._default_permission_handler},
+                        on_permission_request=self._default_permission_handler,
                     )
                     logger.info(f"Resumed Copilot session {resume_sid} for agent '{agent.name}'")
                 except Exception as exc:
@@ -476,7 +487,7 @@ class CopilotProvider(AgentProvider):
 
             # Fall back to creating a new session
             if session is None:
-                session = await self._client.create_session(session_config)
+                session = await self._client.create_session(**session_kwargs)
 
             # Track session ID for checkpoint persistence
             sid = getattr(session, "session_id", None)
@@ -618,9 +629,9 @@ class CopilotProvider(AgentProvider):
                 )
 
             finally:
-                # Destroy session unless it was kept alive for follow-up
+                # Disconnect session unless it was kept alive for follow-up
                 if not session_destroyed:
-                    await session.destroy()
+                    await session.disconnect()
 
         except ProviderError:
             raise
@@ -748,39 +759,31 @@ class CopilotProvider(AgentProvider):
         if event_callback is not None:
             event_callback("agent_turn_start", {"turn": "awaiting_model"})
 
-        await session.send({"prompt": prompt})
+        await session.send(prompt)
 
-        # If interrupt_signal is provided, race between done and interrupt
-        if interrupt_signal is not None:
-            was_interrupted = await self._wait_with_interrupt(
-                done,
-                session,
-                interrupt_signal,
-                last_activity_ref,
-                verbose_enabled,
-                full_enabled,
-            )
-            if was_interrupted:
-                # Return partial content (don't check error_message for partial)
-                return SDKResponse(
-                    content=response_content,
-                    input_tokens=usage_ref[0],
-                    output_tokens=usage_ref[1],
-                    cache_read_tokens=usage_ref[2],
-                    cache_write_tokens=usage_ref[3],
-                    partial=True,
-                )
-        else:
-            # Wait with idle detection and recovery (original path)
-            await self._wait_with_idle_detection(
-                done,
-                session,
-                verbose_enabled,
-                full_enabled,
-                last_activity_ref,
-                max_session_seconds=max_session_seconds,
-                tool_iteration_ref=tool_iteration_ref,
-                max_agent_iterations=max_agent_iterations,
+        # If interrupt_signal is provided, race between done and interrupt,
+        # while also running idle detection. If no interrupt_signal, just
+        # run idle detection alone.
+        was_interrupted = await self._wait_with_idle_detection(
+            done,
+            session,
+            verbose_enabled,
+            full_enabled,
+            last_activity_ref,
+            max_session_seconds=max_session_seconds,
+            tool_iteration_ref=tool_iteration_ref,
+            max_agent_iterations=max_agent_iterations,
+            interrupt_signal=interrupt_signal,
+        )
+        if was_interrupted:
+            # Return partial content (don't check error_message for partial)
+            return SDKResponse(
+                content=response_content,
+                input_tokens=usage_ref[0],
+                output_tokens=usage_ref[1],
+                cache_read_tokens=usage_ref[2],
+                cache_write_tokens=usage_ref[3],
+                partial=True,
             )
 
         if error_message:
@@ -796,67 +799,6 @@ class CopilotProvider(AgentProvider):
             cache_read_tokens=usage_ref[2],
             cache_write_tokens=usage_ref[3],
         )
-
-    async def _wait_with_interrupt(
-        self,
-        done: asyncio.Event,
-        session: Any,
-        interrupt_signal: asyncio.Event,
-        last_activity_ref: list[Any],
-        verbose_enabled: bool,
-        full_enabled: bool,
-    ) -> bool:
-        """Wait for session completion or interrupt signal, whichever comes first.
-
-        If the interrupt signal fires first, attempts to abort the session
-        and waits briefly for a post-abort event (idle or error) before
-        returning.
-
-        Args:
-            done: Event that signals session completion.
-            session: The Copilot SDK session.
-            interrupt_signal: Event that signals a user interrupt request.
-            last_activity_ref: Mutable [last_event_type, last_tool_call, timestamp].
-            verbose_enabled: Whether verbose logging is enabled.
-            full_enabled: Whether full logging mode is enabled.
-
-        Returns:
-            True if interrupted, False if completed normally.
-        """
-        # Create tasks for both events
-        done_waiter = asyncio.create_task(done.wait())
-        interrupt_waiter = asyncio.create_task(interrupt_signal.wait())
-
-        try:
-            finished, pending = await asyncio.wait(
-                {done_waiter, interrupt_waiter},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            # Cancel pending tasks
-            for task in pending:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-
-            if interrupt_waiter in finished:
-                # Interrupt fired — attempt to abort the session
-                interrupt_signal.clear()
-                logger.info("Mid-agent interrupt received, attempting session abort")
-                await self._abort_session(session, done)
-                return True
-
-            # Normal completion
-            return False
-
-        except Exception:
-            # Cleanup on unexpected error
-            for t in (done_waiter, interrupt_waiter):
-                if not t.done():
-                    t.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await t
-            raise
 
     async def _abort_session(self, session: Any, done: asyncio.Event) -> None:
         """Attempt to abort a Copilot SDK session.
@@ -914,7 +856,7 @@ class CopilotProvider(AgentProvider):
         After a mid-agent interrupt, the session is kept alive so that
         the user's guidance can be sent as a follow-up message. This
         method sends the guidance, waits for the response, and then
-        destroys the session.
+        disconnects the session.
 
         Args:
             session: The Copilot SDK session handle (kept alive after interrupt).
@@ -954,7 +896,7 @@ class CopilotProvider(AgentProvider):
                 model=self._default_model,
             )
         finally:
-            await session.destroy()
+            await session.disconnect()
 
     def _log_parse_recovery(
         self,
@@ -1339,13 +1281,16 @@ class CopilotProvider(AgentProvider):
         max_session_seconds: float | None = None,
         tool_iteration_ref: list[int] | None = None,
         max_agent_iterations: int | None = None,
-    ) -> None:
-        """Wait for session completion with idle detection and recovery.
+        interrupt_signal: asyncio.Event | None = None,
+    ) -> bool:
+        """Wait for session completion with idle detection, recovery, and optional interrupt.
 
-        This method replaces a simple `await done.wait()` with intelligent
-        idle detection. If no SDK events are received for the configured
-        idle timeout, it sends a recovery prompt to nudge the session to
-        continue.
+        Combines idle detection (sending recovery prompts to stuck sessions)
+        with interrupt support (aborting on user request). When the model is
+        actively working (SDK events flowing), the idle timer continuously
+        resets — so stuck-detection is suppressed while the model is actively
+        working. The interrupt signal, however, is always raced regardless of
+        activity.
 
         Args:
             done: Event that signals session completion.
@@ -1359,6 +1304,11 @@ class CopilotProvider(AgentProvider):
             tool_iteration_ref: Mutable [count] tracking tool execution starts.
             max_agent_iterations: Maximum tool-use iterations allowed.
                 None means no iteration limit.
+            interrupt_signal: Optional event that signals user interrupt/revive.
+                When set, aborts the session and returns True.
+
+        Returns:
+            True if interrupted, False if completed normally.
 
         Raises:
             ProviderError: If all recovery attempts are exhausted, if the
@@ -1374,7 +1324,7 @@ class CopilotProvider(AgentProvider):
             # Check if done was already set (avoids race where session.idle
             # arrived between a previous done.clear() and the next wait).
             if done.is_set():
-                return
+                return False
 
             # Hard wall-clock limit — prevents sessions from hanging
             # indefinitely even if events keep flowing (e.g. repeated
@@ -1415,12 +1365,45 @@ class CopilotProvider(AgentProvider):
                 )
 
             try:
-                # Wait for done with idle timeout
-                await asyncio.wait_for(
-                    done.wait(),
-                    timeout=idle_timeout,
-                )
-                return  # Completed successfully
+                # Wait for done with idle timeout, also racing interrupt signal
+                if interrupt_signal is not None:
+                    done_waiter = asyncio.create_task(done.wait())
+                    interrupt_waiter = asyncio.create_task(interrupt_signal.wait())
+                    try:
+                        finished, pending = await asyncio.wait(
+                            {done_waiter, interrupt_waiter},
+                            timeout=idle_timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for t in pending:
+                            t.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await t
+                    except Exception:
+                        for t in (done_waiter, interrupt_waiter):
+                            if not t.done():
+                                t.cancel()
+                                with contextlib.suppress(asyncio.CancelledError):
+                                    await t
+                        raise
+
+                    if interrupt_waiter in finished:
+                        logger.info("Mid-agent interrupt received, attempting session abort")
+                        interrupt_signal.clear()
+                        await self._abort_session(session, done)
+                        return True
+
+                    if done_waiter in finished:
+                        return False  # Completed successfully
+
+                    # Neither finished → idle timeout (fall through to idle check)
+                    raise TimeoutError()
+                else:
+                    await asyncio.wait_for(
+                        done.wait(),
+                        timeout=idle_timeout,
+                    )
+                    return False  # Completed successfully
 
             except TimeoutError as e:
                 # Timeout fired — but check if events were recently received.
@@ -1470,7 +1453,7 @@ class CopilotProvider(AgentProvider):
 
                 # Send recovery message
                 recovery_prompt = self._build_recovery_prompt(last_event_type, last_tool_call)
-                await session.send({"prompt": recovery_prompt})
+                await session.send(recovery_prompt)
 
                 # Reset the done event to wait again — but only if it hasn't
                 # been set since the recovery prompt was sent.
