@@ -18,6 +18,7 @@ from pydantic import ValidationError
 
 from conductor.config.schema import AgentDef, GateOption, RetryPolicy
 from conductor.exceptions import ProviderError
+from conductor.exceptions import TimeoutError as _ConductorTimeoutError
 from conductor.providers.copilot import CopilotProvider, RetryConfig
 
 # ---------------------------------------------------------------------------
@@ -502,9 +503,7 @@ class TestClassifyError:
 
     def test_conductor_timeout_classified_as_timeout(self) -> None:
         """Test that ConductorTimeoutError is classified as 'timeout'."""
-        from conductor.exceptions import TimeoutError as ConductorTimeoutError
-
-        error = ConductorTimeoutError(
+        error = _ConductorTimeoutError(
             "Workflow timed out",
             elapsed_seconds=100.0,
             timeout_seconds=60.0,

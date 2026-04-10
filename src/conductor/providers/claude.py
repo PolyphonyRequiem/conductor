@@ -485,10 +485,13 @@ class ClaudeProvider(AgentProvider):
         from conductor.exceptions import ProviderError
         from conductor.exceptions import TimeoutError as ConductorTimeoutError
 
-        if isinstance(error, ConductorTimeoutError):
+        if isinstance(error, (ConductorTimeoutError, asyncio.TimeoutError)):
             return "timeout"
-        if isinstance(error, ProviderError) and "timeout" in str(error).lower():
-            return "timeout"
+        if isinstance(error, ProviderError):
+            if error.status_code == 408:
+                return "timeout"
+            if "timeout" in str(error).lower():
+                return "timeout"
         return "provider_error"
 
     def _is_retryable_error(self, exception: Exception) -> bool:
@@ -851,11 +854,7 @@ class ClaudeProvider(AgentProvider):
                 if config.retry_on is not None:
                     error_category = self._classify_error(e)
                     if error_category not in config.retry_on:
-                        raise ProviderError(
-                            f"Claude API call failed: {e}",
-                            suggestion="Check API key, model name, and request parameters",
-                            is_retryable=False,
-                        ) from e
+                        raise
 
                 # Don't retry if this was the last attempt
                 if attempt >= config.max_attempts:

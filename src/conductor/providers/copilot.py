@@ -1631,10 +1631,13 @@ class CopilotProvider(AgentProvider):
         """
         from conductor.exceptions import TimeoutError as ConductorTimeoutError
 
-        if isinstance(error, ConductorTimeoutError):
+        if isinstance(error, (ConductorTimeoutError, asyncio.TimeoutError)):
             return "timeout"
-        if isinstance(error, ProviderError) and "timeout" in str(error).lower():
-            return "timeout"
+        if isinstance(error, ProviderError):
+            if error.status_code == 408:
+                return "timeout"
+            if "timeout" in str(error).lower():
+                return "timeout"
         return "provider_error"
 
     def _generate_stub_output(self, agent: AgentDef) -> dict[str, Any]:
