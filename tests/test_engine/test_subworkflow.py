@@ -222,7 +222,7 @@ class TestSubWorkflowDepthLimit:
             ],
         )
 
-        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "ok"})
+        provider = CopilotProvider(mock_handler=lambda agent, prompt, context: {"result": "ok"})
         engine = WorkflowEngine(
             config,
             provider,

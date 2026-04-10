@@ -551,11 +551,10 @@ class WorkflowEngine:
 
         # Build sub-workflow inputs from the parent context
         # Extract workflow.input.* values from the parent context
-        sub_inputs: dict[str, Any] = {}
-        if "workflow" in context and isinstance(context["workflow"], dict):
-            workflow_ctx = context["workflow"]
-            if "input" in workflow_ctx and isinstance(workflow_ctx["input"], dict):
-                sub_inputs.update(workflow_ctx["input"])
+        workflow_ctx = context.get("workflow", {})
+        sub_inputs: dict[str, Any] = dict(workflow_ctx.get("input", {})) if isinstance(
+            workflow_ctx, dict
+        ) else {}
 
         # Create child engine inheriting provider/registry but with deeper depth
         child_engine = WorkflowEngine(
