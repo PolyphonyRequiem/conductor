@@ -1629,7 +1629,7 @@ class CopilotProvider(AgentProvider):
         Returns:
             Error category string: "provider_error" or "timeout".
         """
-        from conductor.exceptions import ConductorTimeoutError
+        from conductor.exceptions import TimeoutError as ConductorTimeoutError
 
         if isinstance(error, ConductorTimeoutError):
             return "timeout"

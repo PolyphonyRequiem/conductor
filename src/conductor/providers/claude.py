@@ -482,7 +482,8 @@ class ClaudeProvider(AgentProvider):
         Returns:
             Error category string: "provider_error" or "timeout".
         """
-        from conductor.exceptions import ConductorTimeoutError, ProviderError
+        from conductor.exceptions import ProviderError
+        from conductor.exceptions import TimeoutError as ConductorTimeoutError
 
         if isinstance(error, ConductorTimeoutError):
             return "timeout"
@@ -870,9 +871,7 @@ class ClaudeProvider(AgentProvider):
                 else:
                     # Calculate delay with backoff
                     delay = self._calculate_delay(attempt, config)
-                    logger.info(
-                        f"Calculated backoff delay: {delay:.2f}s for attempt {attempt}"
-                    )
+                    logger.info(f"Calculated backoff delay: {delay:.2f}s for attempt {attempt}")
 
                 # Log retry attempt with full context
                 logger.warning(
