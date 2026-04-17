@@ -510,9 +510,7 @@ class TestWaitForGateResponse:
             {"agent_name": "plan_approval", "selected_value": "approved"}
         )
 
-        msg = await asyncio.wait_for(
-            dashboard.wait_for_gate_response("plan_approval"), timeout=1.0
-        )
+        msg = await asyncio.wait_for(dashboard.wait_for_gate_response("plan_approval"), timeout=1.0)
 
         assert msg["selected_value"] == "approved"
 
@@ -534,9 +532,7 @@ class TestWaitForGateResponse:
             {"agent_name": "current_gate", "selected_value": "rejected"}
         )
 
-        msg = await asyncio.wait_for(
-            dashboard.wait_for_gate_response("current_gate"), timeout=1.0
-        )
+        msg = await asyncio.wait_for(dashboard.wait_for_gate_response("current_gate"), timeout=1.0)
 
         assert msg["agent_name"] == "current_gate"
         assert msg["selected_value"] == "rejected"
