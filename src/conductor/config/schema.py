@@ -396,7 +396,7 @@ class AgentDef(BaseModel):
     description: str | None = None
     """Human-readable description of agent's purpose."""
 
-    type: Literal["agent", "human_gate", "script"] | None = None
+    type: Literal["agent", "human_gate", "script", "workflow"] | None = None
     """Agent type. Defaults to 'agent' if not specified."""
 
     provider: Literal["copilot", "claude"] | None = None
@@ -463,6 +463,17 @@ class AgentDef(BaseModel):
 
     timeout: int | None = None
     """Per-script timeout in seconds."""
+
+    workflow: str | None = None
+    """Path to sub-workflow YAML file (required for type='workflow').
+
+    The path is resolved relative to the parent workflow file.
+    Sub-workflows run as black boxes — their internal agents are not
+    visible to the parent workflow.
+
+    Example:
+        workflow: ./research-pipeline.yaml
+    """
 
     max_session_seconds: float | None = Field(None, ge=1.0)
     """Maximum wall-clock duration for this agent's session in seconds.
@@ -544,6 +555,29 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'max_agent_iterations'")
             if self.retry is not None:
                 raise ValueError("script agents cannot have 'retry'")
+        elif self.type == "workflow":
+            if not self.workflow:
+                raise ValueError("workflow agents require 'workflow' path")
+            if self.prompt:
+                raise ValueError("workflow agents cannot have 'prompt'")
+            if self.provider:
+                raise ValueError("workflow agents cannot have 'provider'")
+            if self.model:
+                raise ValueError("workflow agents cannot have 'model'")
+            if self.tools is not None:
+                raise ValueError("workflow agents cannot have 'tools'")
+            if self.system_prompt:
+                raise ValueError("workflow agents cannot have 'system_prompt'")
+            if self.options:
+                raise ValueError("workflow agents cannot have 'options'")
+            if self.command:
+                raise ValueError("workflow agents cannot have 'command'")
+            if self.max_session_seconds:
+                raise ValueError("workflow agents cannot have 'max_session_seconds'")
+            if self.max_agent_iterations is not None:
+                raise ValueError("workflow agents cannot have 'max_agent_iterations'")
+            if self.retry is not None:
+                raise ValueError("workflow agents cannot have 'retry'")
         return self
 
 
