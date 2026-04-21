@@ -243,7 +243,10 @@ def run(
         typer.Option(
             "--metadata",
             "-m",
-            help="Workflow metadata in key=value format. Merged on top of YAML metadata. Can be repeated.",
+            help=(
+                "Workflow metadata in key=value format. "
+                "Merged on top of YAML metadata. Can be repeated."
+            ),
         ),
     ] = None,
     dry_run: Annotated[
