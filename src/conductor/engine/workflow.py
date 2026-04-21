@@ -1134,6 +1134,7 @@ class WorkflowEngine:
                             for r in f.routes
                         ],
                         **self._yaml_source_field(),
+                        "metadata": self.config.workflow.metadata,
                     },
                 )
 
