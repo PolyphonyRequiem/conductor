@@ -640,6 +640,7 @@ class WorkflowEngine:
         self,
         agent: AgentDef,
         sub_inputs: dict[str, Any],
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Execute a sub-workflow with pre-built inputs.
 
@@ -650,6 +651,9 @@ class WorkflowEngine:
         Args:
             agent: Workflow agent definition with ``workflow`` path.
             sub_inputs: Pre-built input dict for the sub-workflow.
+            context: Optional parent workflow context. When provided, parent
+                agent outputs are injected into the child workflow's context
+                so sub-workflow agents can reference them.
 
         Returns:
             The sub-workflow's final output dict.
@@ -712,9 +716,10 @@ class WorkflowEngine:
         # This allows sub-workflow agents that declare parent agents in their
         # input: list (e.g., task_manager.output?) to access parent state
         # even when input_mapping doesn't cover all fields.
-        for key, value in context.items():
-            if key not in ("workflow", "context") and isinstance(value, dict):
-                child_engine.context.agent_outputs[key] = value.get("output", value)
+        if context is not None:
+            for key, value in context.items():
+                if key not in ("workflow", "context") and isinstance(value, dict):
+                    child_engine.context.agent_outputs[key] = value.get("output", value)
 
         return await child_engine.run(sub_inputs)
 
@@ -1585,6 +1590,13 @@ class WorkflowEngine:
                                 agent.input,
                                 mode=self.config.workflow.context.mode,
                             )
+                            # Script args are rendered locally (no LLM cost), so
+                            # workflow inputs must always be available for template
+                            # resolution — even in explicit mode where they'd
+                            # otherwise be filtered out.
+                            agent_context.setdefault("workflow", {})["input"] = (
+                                self.context.workflow_inputs.copy()
+                            )
                             _script_start = _time.time()
 
                             # Count how many times this specific script has been executed
@@ -1676,6 +1688,12 @@ class WorkflowEngine:
                                 agent.name,
                                 agent.input,
                                 mode=self.config.workflow.context.mode,
+                            )
+                            # input_mapping templates are rendered locally (no LLM
+                            # cost), so workflow inputs must always be available —
+                            # even in explicit mode.
+                            agent_context.setdefault("workflow", {})["input"] = (
+                                self.context.workflow_inputs.copy()
                             )
                             _sub_start = _time.time()
 
@@ -2763,6 +2781,13 @@ class WorkflowEngine:
                     for_each_group.agent.input,
                     mode=self.config.workflow.context.mode,
                 )
+                # input_mapping templates for sub-workflows are rendered
+                # locally (no LLM cost), so workflow inputs must always
+                # be available — even in explicit mode.
+                if for_each_group.agent.type == "workflow":
+                    agent_context.setdefault("workflow", {})["input"] = (
+                        context_snapshot.workflow_inputs.copy()
+                    )
 
                 # Inject loop variables into context
                 self._inject_loop_variables(
@@ -2801,7 +2826,7 @@ class WorkflowEngine:
                         },
                     )
                     output_content = await self._execute_subworkflow_with_inputs(
-                        for_each_group.agent, sub_inputs
+                        for_each_group.agent, sub_inputs, agent_context
                     )
                     _item_elapsed = _time.time() - _item_start
 
