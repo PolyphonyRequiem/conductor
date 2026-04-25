@@ -330,10 +330,65 @@ class TestWorkflowEngineContextModes:
         provider = CopilotProvider(mock_handler=lambda a, p, c: {})
         engine = WorkflowEngine(config, provider)
 
-        result = await engine.run({"work_item_id": 42})
+        await engine.run({"work_item_id": 42})
 
         # Script should have rendered the template successfully
         assert engine.context.agent_outputs["detector"]["stdout"].strip() == "42"
+
+    @pytest.mark.asyncio
+    async def test_script_json_stdout_parsed_into_output(self) -> None:
+        """Test that script stdout containing JSON is auto-parsed into output fields.
+
+        Script agents that emit JSON to stdout should have those fields
+        merged into output alongside stdout/stderr/exit_code, making them
+        available for route conditions and downstream templates.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="json-script",
+                entry_point="detector",
+            ),
+            agents=[
+                AgentDef(
+                    name="detector",
+                    type="script",
+                    command="pwsh",
+                    args=[
+                        "-Command",
+                        (
+                            'Write-Output \'{"plan_exists": true,'
+                            ' "route": "planning"}\'; exit 0'
+                        ),
+                    ],
+                    routes=[
+                        RouteDef(to="planner", when="route == 'planning'"),
+                        RouteDef(to="$end"),
+                    ],
+                ),
+                AgentDef(
+                    name="planner",
+                    type="script",
+                    command="pwsh",
+                    args=["-Command", "Write-Output 'done'; exit 0"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(config, provider)
+
+        await engine.run({})
+
+        # Parsed JSON fields should be in output
+        det = engine.context.agent_outputs["detector"]
+        assert det["plan_exists"] is True
+        assert det["route"] == "planning"
+        # Raw stdout/exit_code still available
+        assert "stdout" in det
+        assert det["exit_code"] == 0
+        # Route condition used parsed field — planner should have run
+        assert "planner" in engine.context.agent_outputs
 
 
 class TestWorkflowEngineRouting:
