@@ -990,6 +990,7 @@ async def run_workflow_async(
     web: bool = False,
     web_port: int = 0,
     web_bg: bool = False,
+    metadata: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Execute a workflow asynchronously.
 
@@ -1003,6 +1004,7 @@ async def run_workflow_async(
         web: If True, start a real-time web dashboard.
         web_port: Port for the web dashboard (0 = auto-select).
         web_bg: If True, auto-shutdown dashboard after workflow + client disconnect.
+        metadata: Optional CLI metadata to merge on top of YAML-declared metadata.
 
     Returns:
         The workflow output as a dictionary.
@@ -1032,7 +1034,13 @@ async def run_workflow_async(
         from conductor.web.server import WebDashboard
 
         bg_mode = web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1"
-        dashboard = WebDashboard(emitter, host="127.0.0.1", port=web_port, bg=bg_mode)
+        dashboard = WebDashboard(
+            emitter,
+            host="127.0.0.1",
+            port=web_port,
+            bg=bg_mode,
+            workflow_root=Path(workflow_path).resolve().parent,
+        )
 
         try:
             await dashboard.start()
@@ -1053,6 +1061,10 @@ async def run_workflow_async(
         load_start = time.time()
         config = load_config(workflow_path)
         verbose_log_timing("Configuration loaded", time.time() - load_start)
+
+        # Merge CLI metadata on top of YAML-declared metadata
+        if metadata:
+            config.workflow.metadata.update(metadata)
 
         # Log workflow details
         verbose_log(f"Workflow: {config.workflow.name}")
@@ -1116,6 +1128,10 @@ async def run_workflow_async(
                 event_emitter=emitter,
                 keyboard_listener=listener,
                 web_dashboard=dashboard,
+                run_id=event_log_subscriber.run_id if event_log_subscriber else "",
+                log_file=str(event_log_subscriber.path) if event_log_subscriber else "",
+                dashboard_port=(dashboard._actual_port if dashboard is not None else None),
+                bg_mode=web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1",
             )
 
             # Share interrupt_event with dashboard so POST /api/stop can abort agents
