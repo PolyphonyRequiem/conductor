@@ -537,9 +537,26 @@ class CopilotProvider(AgentProvider):
                     self._temperature,
                 )
 
-            # Add MCP servers if configured
+            # Add MCP servers if configured (filtered by agent tool scope)
             if self._mcp_servers:
-                session_kwargs["mcp_servers"] = self._mcp_servers
+                from conductor.mcp.tool_filter import filter_mcp_server_configs
+
+                filtered_servers = filter_mcp_server_configs(self._mcp_servers, tools)
+                if filtered_servers:
+                    session_kwargs["mcp_servers"] = filtered_servers
+                    if filtered_servers is not self._mcp_servers:
+                        logger.debug(
+                            "Filtered MCP servers for agent '%s': %s → %s",
+                            agent.name,
+                            list(self._mcp_servers.keys()),
+                            list(filtered_servers.keys()),
+                        )
+                else:
+                    logger.debug(
+                        "All MCP servers filtered out for agent '%s' (tools=%s)",
+                        agent.name,
+                        tools,
+                    )
 
             # Attempt to resume a previous session if one exists for this agent
             session: Any = None

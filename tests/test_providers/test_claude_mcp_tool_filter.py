@@ -124,6 +124,72 @@ class TestConvertMcpToolsFilter:
 
 
 # ---------------------------------------------------------------------------
+# Extended tool matching with server/original_name metadata
+# ---------------------------------------------------------------------------
+
+RICH_MCP_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "filesystem__read_file",
+        "description": "Read a file",
+        "input_schema": {"type": "object"},
+        "server": "filesystem",
+        "original_name": "read_file",
+    },
+    {
+        "name": "filesystem__write_file",
+        "description": "Write a file",
+        "input_schema": {"type": "object"},
+        "server": "filesystem",
+        "original_name": "write_file",
+    },
+    {
+        "name": "web_search__search",
+        "description": "Search the web",
+        "input_schema": {"type": "object"},
+        "server": "web_search",
+        "original_name": "search",
+    },
+]
+
+
+class TestConvertMcpToolsServerNameMatch:
+    """Tests for server name matching in _convert_mcp_tools_to_claude."""
+
+    def test_server_name_includes_all_server_tools(self) -> None:
+        """Filter by server name includes all tools from that server."""
+        provider = _make_provider_with_mcp_tools(RICH_MCP_TOOLS)
+        result = provider._convert_mcp_tools_to_claude(tool_filter=["filesystem"])
+        assert len(result) == 2
+        names = {t["name"] for t in result}
+        assert names == {"filesystem__read_file", "filesystem__write_file"}
+
+    def test_unprefixed_tool_name_match(self) -> None:
+        """Filter by unprefixed tool name matches original_name."""
+        provider = _make_provider_with_mcp_tools(RICH_MCP_TOOLS)
+        result = provider._convert_mcp_tools_to_claude(tool_filter=["search"])
+        assert len(result) == 1
+        assert result[0]["name"] == "web_search__search"
+
+    def test_mixed_prefixed_and_unprefixed(self) -> None:
+        """Mix of prefixed and unprefixed filters."""
+        provider = _make_provider_with_mcp_tools(RICH_MCP_TOOLS)
+        result = provider._convert_mcp_tools_to_claude(
+            tool_filter=["filesystem__read_file", "search"]
+        )
+        assert len(result) == 2
+        names = {t["name"] for t in result}
+        assert names == {"filesystem__read_file", "web_search__search"}
+
+    def test_server_name_and_prefixed_combined(self) -> None:
+        """Server name plus specific prefixed tool from another server."""
+        provider = _make_provider_with_mcp_tools(RICH_MCP_TOOLS)
+        result = provider._convert_mcp_tools_to_claude(
+            tool_filter=["filesystem", "web_search__search"]
+        )
+        assert len(result) == 3
+
+
+# ---------------------------------------------------------------------------
 # Helpers for _has_mcp_tool_use / _execute_with_parse_recovery tests
 # ---------------------------------------------------------------------------
 

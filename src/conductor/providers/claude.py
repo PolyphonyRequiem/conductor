@@ -361,11 +361,16 @@ class ClaudeProvider(AgentProvider):
         self,
         tool_filter: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Convert MCP tools to Claude tool format.
+        """Convert MCP tools to Claude-compatible tool definitions.
+
+        Uses the shared tool filter logic to support matching by:
+        - Prefixed names (``server__tool``)
+        - Server names (include all tools from that server)
+        - Unprefixed tool names (match original tool name across servers)
 
         Args:
-            tool_filter: Optional list of tool names to include (prefixed names).
-                If None, all tools are included.
+            tool_filter: Optional list of tool names to include.
+                If None or empty, all tools are included.
 
         Returns:
             List of tool definitions in Claude's expected format.
@@ -373,21 +378,19 @@ class ClaudeProvider(AgentProvider):
         if not self._mcp_manager:
             return []
 
-        claude_tools: list[dict[str, Any]] = []
-        for tool in self._mcp_manager.get_all_tools():
-            # Apply filter if specified
-            if tool_filter and tool["name"] not in tool_filter:
-                continue
+        from conductor.mcp.tool_filter import filter_mcp_tool_defs
 
-            claude_tools.append(
-                {
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "input_schema": tool["input_schema"],
-                }
-            )
+        all_tools = self._mcp_manager.get_all_tools()
+        filtered = filter_mcp_tool_defs(all_tools, tool_filter)
 
-        return claude_tools
+        return [
+            {
+                "name": tool["name"],
+                "description": tool["description"],
+                "input_schema": tool["input_schema"],
+            }
+            for tool in filtered
+        ]
 
     async def close(self) -> None:
         """Release provider resources and close connections."""

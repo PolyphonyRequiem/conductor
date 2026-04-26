@@ -617,10 +617,12 @@ class WorkflowEngine:
             )
 
         # Create child engine inheriting provider/registry but with deeper depth
+        # Merge child's MCP servers with parent's registry if applicable
+        child_registry = await self._build_child_registry(sub_config)
         child_engine = WorkflowEngine(
             config=sub_config,
             provider=self._single_provider,
-            registry=self._registry,
+            registry=child_registry,
             skip_gates=self.skip_gates,
             workflow_path=sub_path,
             interrupt_event=self._interrupt_event,
@@ -638,7 +640,12 @@ class WorkflowEngine:
             if key not in ("workflow", "context") and isinstance(value, dict):
                 child_engine.context.agent_outputs[key] = value.get("output", value)
 
-        return await child_engine.run(sub_inputs)
+        try:
+            return await child_engine.run(sub_inputs)
+        finally:
+            # Clean up child registry if it was newly created
+            if child_registry is not self._registry and child_registry is not None:
+                await child_registry.close()
 
     async def _execute_subworkflow_with_inputs(
         self,
@@ -703,10 +710,11 @@ class WorkflowEngine:
                 suggestion="Check the sub-workflow YAML for syntax or validation errors.",
             ) from exc
 
+        child_registry = await self._build_child_registry(sub_config)
         child_engine = WorkflowEngine(
             config=sub_config,
             provider=self._single_provider,
-            registry=self._registry,
+            registry=child_registry,
             skip_gates=self.skip_gates,
             workflow_path=sub_path,
             interrupt_event=self._interrupt_event,
@@ -725,7 +733,40 @@ class WorkflowEngine:
                 if key not in ("workflow", "context") and isinstance(value, dict):
                     child_engine.context.agent_outputs[key] = value.get("output", value)
 
-        return await child_engine.run(sub_inputs)
+        try:
+            return await child_engine.run(sub_inputs)
+        finally:
+            # Clean up child registry if it was newly created
+            if child_registry is not self._registry and child_registry is not None:
+                await child_registry.close()
+
+    async def _build_child_registry(
+        self,
+        sub_config: WorkflowConfig,
+    ) -> ProviderRegistry | None:
+        """Build a ProviderRegistry for a child sub-workflow.
+
+        If the child workflow declares its own ``mcp_servers:``, they are
+        merged with the parent's MCP servers (parent wins on name collision).
+        A new registry is returned, created from the child config so that
+        provider defaults come from the child workflow.
+
+        If the child has no new MCP servers, the parent's registry is
+        reused to avoid unnecessary resource duplication.
+
+        Args:
+            sub_config: The child sub-workflow's parsed configuration.
+
+        Returns:
+            A ProviderRegistry (possibly new, possibly the parent's).
+        """
+        from conductor.mcp.utils import build_mcp_servers
+
+        if self._registry is None:
+            return None
+
+        child_mcp_servers = await build_mcp_servers(sub_config)
+        return self._registry.merge_mcp_servers(sub_config, child_mcp_servers)
 
     def _get_context_window_for_agent(self, agent: AgentDef) -> int | None:
         """Return the context window size for an agent's model."""

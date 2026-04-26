@@ -23,7 +23,6 @@ from rich.table import Table
 
 from conductor.config.loader import load_config
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
-from conductor.mcp_auth import resolve_mcp_server_auth
 from conductor.providers.registry import ProviderRegistry
 
 if TYPE_CHECKING:
@@ -116,22 +115,9 @@ def resolve_mcp_env_vars(env: dict[str, str]) -> dict[str, str]:
         >>> resolve_mcp_env_vars({'API_KEY': '${MY_KEY}', 'DEBUG': '${DEBUG:-false}'})
         {'API_KEY': 'secret123', 'DEBUG': 'false'}
     """
+    from conductor.mcp.utils import resolve_env_vars
 
-    def replace_match(match: re.Match[str]) -> str:
-        var_name = match.group(1)
-        default_value = match.group(2)
-        env_value = os.environ.get(var_name)
-        if env_value is not None:
-            return env_value
-        elif default_value is not None:
-            return default_value
-        else:
-            return ""
-
-    resolved: dict[str, str] = {}
-    for key, value in env.items():
-        resolved[key] = _ENV_VAR_PATTERN.sub(replace_match, value)
-    return resolved
+    return resolve_env_vars(env)
 
 
 def verbose_log(message: str, style: str = "dim") -> None:
@@ -1600,33 +1586,9 @@ async def _build_mcp_servers(config: Any) -> dict[str, Any] | None:
     Returns:
         MCP server configurations dict, or None if none configured.
     """
-    if not config.workflow.runtime.mcp_servers:
-        return None
+    from conductor.mcp.utils import build_mcp_servers
 
-    mcp_servers: dict[str, Any] = {}
-    for name, server in config.workflow.runtime.mcp_servers.items():
-        if server.type in ("http", "sse"):
-            server_config: dict[str, Any] = {
-                "type": server.type,
-                "url": server.url,
-                "tools": server.tools,
-            }
-            if server.headers:
-                server_config["headers"] = server.headers
-            if server.timeout:
-                server_config["timeout"] = server.timeout
-            server_config = await resolve_mcp_server_auth(name, server_config)
-        else:
-            server_config = {
-                "type": "stdio",
-                "command": server.command,
-                "args": server.args,
-                "tools": server.tools,
-            }
-            if server.env:
-                server_config["env"] = resolve_mcp_env_vars(server.env)
-            if server.timeout:
-                server_config["timeout"] = server.timeout
-        mcp_servers[name] = server_config
-    verbose_log(f"MCP servers configured: {list(mcp_servers.keys())}")
-    return mcp_servers
+    result = await build_mcp_servers(config)
+    if result:
+        verbose_log(f"MCP servers configured: {list(result.keys())}")
+    return result

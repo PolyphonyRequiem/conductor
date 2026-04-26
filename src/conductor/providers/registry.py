@@ -6,6 +6,7 @@ provider instances with lazy instantiation and caching.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Literal
 
 from conductor.providers.base import AgentProvider
@@ -13,6 +14,8 @@ from conductor.providers.factory import create_provider
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, WorkflowConfig
+
+logger = logging.getLogger(__name__)
 
 
 ProviderType = Literal["copilot", "openai-agents", "claude"]
@@ -126,6 +129,51 @@ class ProviderRegistry:
 
         self._providers[provider_type] = provider
         return provider
+
+    def merge_mcp_servers(
+        self,
+        child_config: WorkflowConfig,
+        child_mcp_servers: dict[str, Any] | None,
+    ) -> ProviderRegistry:
+        """Create a new registry with child MCP servers merged in.
+
+        Used by sub-workflow execution to give child workflows access
+        to both parent and child MCP servers. Parent definitions win
+        on name collision.
+
+        The new registry is created from the child's config so that
+        provider defaults (model, temperature, etc.) come from the
+        child workflow.
+
+        Args:
+            child_config: The child sub-workflow's configuration.
+            child_mcp_servers: Child's MCP server configs (built from
+                child's ``mcp_servers:`` YAML section).
+
+        Returns:
+            A new ProviderRegistry with merged MCP servers if the child
+            has new servers, or ``self`` if no merging is needed.
+        """
+        from conductor.mcp.utils import merge_mcp_server_configs
+
+        merged = merge_mcp_server_configs(self._mcp_servers, child_mcp_servers)
+
+        # If nothing changed, reuse this registry (no overhead)
+        if merged is self._mcp_servers:
+            return self
+
+        logger.debug(
+            "Merged MCP servers for sub-workflow: parent=%s, child=%s, result=%s",
+            list((self._mcp_servers or {}).keys()),
+            list((child_mcp_servers or {}).keys()),
+            list((merged or {}).keys()),
+        )
+
+        new_registry = ProviderRegistry(child_config, mcp_servers=merged)
+        # Propagate resume session IDs to the child registry
+        if self._resume_session_ids:
+            new_registry.set_resume_session_ids(self._resume_session_ids)
+        return new_registry
 
     async def close(self) -> None:
         """Close all provider instances.
