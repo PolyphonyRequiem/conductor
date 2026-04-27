@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 def resolve_agent_tools(
     agent_tools: list[str] | None,
     workflow_tools: list[str],
-) -> list[str]:
+) -> list[str] | None:
     """Resolve which tools an agent should have access to.
 
     The resolution follows these rules:
@@ -46,25 +46,39 @@ def resolve_agent_tools(
     - agent_tools=[] (empty list): Agent gets NO tools
     - agent_tools=[list]: Agent gets only specified tools (must be subset of workflow)
 
+    When workflow_tools is empty (no top-level ``tools:`` declared, e.g. when
+    tools come from MCP servers), tool resolution is unconstrained:
+    - agent_tools=None → None (all available tools, including MCP)
+    - agent_tools=[] → [] (no tools)
+    - agent_tools=[list] → list passed through without subset validation
+
     Args:
         agent_tools: Agent's tool specification (None=all, []=none, [list]=subset)
         workflow_tools: Tools defined at workflow level
 
     Returns:
-        List of tool names for this agent
+        List of tool names for this agent, or None meaning unconstrained
+        (all available tools including MCP).
 
     Raises:
         ValidationError: If agent specifies tools not in workflow tools
     """
     if agent_tools is None:
-        # None means all workflow tools
+        if not workflow_tools:
+            # No workflow-level restriction — return None to preserve
+            # "all available tools" semantic for MCP tool filtering
+            return None
         return workflow_tools.copy()
 
     if not agent_tools:
         # Empty list means no tools
         return []
 
-    # Validate subset
+    # No workflow-level tools means no restriction — pass through agent's list
+    if not workflow_tools:
+        return agent_tools.copy()
+
+    # Validate subset (only when workflow declares explicit tool constraints)
     invalid = set(agent_tools) - set(workflow_tools)
     if invalid:
         sorted_invalid = sorted(invalid)

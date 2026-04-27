@@ -340,7 +340,7 @@ class TestToolValidation:
         assert "unknown_tool" in str(exc_info.value)
 
     def test_no_tools_defined_but_agent_uses_some(self) -> None:
-        """Test agent using tools when no tools defined at workflow level."""
+        """Test agent using tools when no tools defined at workflow level and no MCP servers."""
         config = WorkflowConfig(
             workflow=WorkflowDef(name="test", entry_point="agent1"),
             tools=[],  # No tools defined
@@ -357,6 +357,63 @@ class TestToolValidation:
         with pytest.raises(ConfigurationError) as exc_info:
             validate_workflow_config(config)
         assert "web_search" in str(exc_info.value)
+
+    def test_mcp_servers_skip_tool_validation_when_no_workflow_tools(self) -> None:
+        """Test that agent tools are not validated when MCP servers provide tools at runtime."""
+        from conductor.config.schema import MCPServerDef, RuntimeConfig
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test",
+                entry_point="agent1",
+                runtime=RuntimeConfig(
+                    mcp_servers={
+                        "twig": MCPServerDef(command="twig-mcp", tools=["*"]),
+                    }
+                ),
+            ),
+            tools=[],  # No workflow-level tools — MCP servers provide them
+            agents=[
+                AgentDef(
+                    name="agent1",
+                    model="gpt-4",
+                    prompt="Hello",
+                    tools=["twig_set", "twig_show"],  # MCP-provided tools
+                    routes=[RouteDef(to="$end")],
+                )
+            ],
+        )
+        # Should NOT raise — tools come from MCP servers at runtime
+        validate_workflow_config(config)
+
+    def test_mcp_servers_with_explicit_tools_still_validates(self) -> None:
+        """Test that explicit workflow tools are still validated even with MCP servers."""
+        from conductor.config.schema import MCPServerDef, RuntimeConfig
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test",
+                entry_point="agent1",
+                runtime=RuntimeConfig(
+                    mcp_servers={
+                        "twig": MCPServerDef(command="twig-mcp", tools=["*"]),
+                    }
+                ),
+            ),
+            tools=["web_search"],  # Explicit workflow tools declared
+            agents=[
+                AgentDef(
+                    name="agent1",
+                    model="gpt-4",
+                    prompt="Hello",
+                    tools=["unknown_tool"],  # Not in explicit tools list
+                    routes=[RouteDef(to="$end")],
+                )
+            ],
+        )
+        with pytest.raises(ConfigurationError) as exc_info:
+            validate_workflow_config(config)
+        assert "unknown_tool" in str(exc_info.value)
 
 
 class TestOutputReferenceValidation:

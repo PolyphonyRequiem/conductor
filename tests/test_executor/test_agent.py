@@ -370,8 +370,9 @@ class TestAgentExecutorWithTools:
         await executor.execute(agent, {})
 
         call_history = provider.get_call_history()
-        # Agent should get empty list when workflow has no tools
-        assert call_history[0]["tools"] == []
+        # Agent should get None (unconstrained) when workflow has no tools
+        # This preserves "all available tools" semantic for MCP servers
+        assert call_history[0]["tools"] is None
 
     @pytest.mark.asyncio
     async def test_execute_with_unknown_tools_raises_error(self) -> None:
@@ -465,18 +466,17 @@ class TestResolveAgentTools:
         assert "web_search" in exc_info.value.suggestion
 
     def test_empty_workflow_tools_with_none_agent_tools(self) -> None:
-        """Test that empty workflow tools with None agent tools returns empty."""
+        """Test that empty workflow tools with None agent tools returns None (unconstrained)."""
         workflow_tools: list[str] = []
         result = resolve_agent_tools(None, workflow_tools)
-        assert result == []
+        assert result is None
 
-    def test_empty_workflow_tools_with_agent_tools_raises(self) -> None:
-        """Test that agent tools with empty workflow tools raises error."""
+    def test_empty_workflow_tools_with_agent_tools_passes_through(self) -> None:
+        """Test that agent tools pass through when no workflow tools are declared."""
         workflow_tools: list[str] = []
         agent_tools = ["tool_a"]
-
-        with pytest.raises(ValidationError, match="unknown tools"):
-            resolve_agent_tools(agent_tools, workflow_tools)
+        result = resolve_agent_tools(agent_tools, workflow_tools)
+        assert result == ["tool_a"]
 
     def test_all_workflow_tools_as_agent_subset(self) -> None:
         """Test requesting all workflow tools as explicit subset works."""
