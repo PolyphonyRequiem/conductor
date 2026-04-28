@@ -14,6 +14,7 @@ from conductor.config.schema import (
     AgentDef,
     ContextConfig,
     GateOption,
+    InputDef,
     LimitsConfig,
     OutputField,
     ParallelGroup,
@@ -297,6 +298,144 @@ class TestWorkflowEngineContextModes:
         assert "agent1" in agent2_context
         # Workflow.input.goal should not be in agent2's context since it's not in input list
         assert "other" not in agent2_context.get("workflow", {}).get("input", {})
+
+    @pytest.mark.asyncio
+    async def test_explicit_mode_script_gets_workflow_inputs(self) -> None:
+        """Regression: script agents in explicit mode must see workflow.input.
+
+        In explicit mode, workflow.input was empty {} for script agents that
+        didn't declare inputs. Script args are rendered locally (no LLM cost),
+        so workflow inputs must always be available for template resolution.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="explicit-script",
+                entry_point="detector",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                AgentDef(
+                    name="detector",
+                    type="script",
+                    command="pwsh",
+                    args=[
+                        "-Command",
+                        "Write-Output '{{ workflow.input.work_item_id }}'; exit 0",
+                    ],
+                    # No input: list — should still see workflow.input
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(config, provider)
+
+        await engine.run({"work_item_id": 42})
+
+        # Script should have rendered the template successfully
+        assert engine.context.agent_outputs["detector"]["stdout"].strip() == "42"
+
+    @pytest.mark.asyncio
+    async def test_script_json_stdout_parsed_into_output(self) -> None:
+        """Test that script stdout containing JSON is auto-parsed into output fields.
+
+        Script agents that emit JSON to stdout should have those fields
+        merged into output alongside stdout/stderr/exit_code, making them
+        available for route conditions and downstream templates.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="json-script",
+                entry_point="detector",
+            ),
+            agents=[
+                AgentDef(
+                    name="detector",
+                    type="script",
+                    command="pwsh",
+                    args=[
+                        "-Command",
+                        (
+                            'Write-Output \'{"plan_exists": true,'
+                            ' "route": "planning"}\'; exit 0'
+                        ),
+                    ],
+                    routes=[
+                        RouteDef(to="planner", when="route == 'planning'"),
+                        RouteDef(to="$end"),
+                    ],
+                ),
+                AgentDef(
+                    name="planner",
+                    type="script",
+                    command="pwsh",
+                    args=["-Command", "Write-Output 'done'; exit 0"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(config, provider)
+
+        await engine.run({})
+
+        # Parsed JSON fields should be in output
+        det = engine.context.agent_outputs["detector"]
+        assert det["plan_exists"] is True
+        assert det["route"] == "planning"
+        # Raw stdout/exit_code still available
+        assert "stdout" in det
+        assert det["exit_code"] == 0
+        # Route condition used parsed field — planner should have run
+        assert "planner" in engine.context.agent_outputs
+
+    @pytest.mark.asyncio
+    async def test_optional_input_defaults_render_cleanly(self) -> None:
+        """Optional inputs without defaults use type-appropriate zero values.
+
+        Ensures optional string inputs render as '' (not 'None'),
+        optional numbers as 0 (not 'None'), etc.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="optional-defaults",
+                entry_point="echo",
+                input={
+                    "required_id": InputDef(type="number", required=True),
+                    "optional_msg": InputDef(type="string", required=False),
+                    "optional_count": InputDef(type="number", required=False),
+                    "with_default": InputDef(type="string", required=False, default="hello"),
+                },
+            ),
+            agents=[
+                AgentDef(
+                    name="echo",
+                    type="script",
+                    command="pwsh",
+                    args=[
+                        "-Command",
+                        (
+                            "Write-Output 'msg={{ workflow.input.optional_msg }}"
+                            " count={{ workflow.input.optional_count }}"
+                            " def={{ workflow.input.with_default }}'; exit 0"
+                        ),
+                    ],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(config, provider)
+
+        await engine.run({"required_id": 42})
+
+        stdout = engine.context.agent_outputs["echo"]["stdout"].strip()
+        assert "msg=" in stdout
+        assert "None" not in stdout  # Should never render Python's None
+        assert "def=hello" in stdout  # Explicit default works
 
 
 class TestWorkflowEngineRouting:

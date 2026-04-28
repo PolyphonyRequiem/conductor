@@ -268,10 +268,29 @@ class TestSubWorkflowErrors:
             await engine.run({})
 
     @pytest.mark.asyncio
-    async def test_self_referencing_workflow(self, tmp_workflow_dir: Path) -> None:
-        """Test that a workflow referencing itself raises ExecutionError."""
+    async def test_self_referencing_workflow_hits_depth_limit(self, tmp_workflow_dir: Path) -> None:
+        """Test that a self-referencing workflow is allowed but bounded by depth limit."""
+        # Write a real self-referencing workflow YAML
         parent_path = tmp_workflow_dir / "parent.yaml"
-        parent_path.write_text("dummy", encoding="utf-8")
+        _write_yaml(
+            parent_path,
+            """\
+            workflow:
+              name: self-ref
+              entry_point: sub_wf
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 50
+            agents:
+              - name: sub_wf
+                type: workflow
+                workflow: parent.yaml
+                routes:
+                  - to: "$end"
+            output: {}
+            """,
+        )
 
         config = WorkflowConfig(
             workflow=WorkflowDef(
@@ -294,7 +313,58 @@ class TestSubWorkflowErrors:
         mock_provider = MagicMock()
         engine = WorkflowEngine(config, mock_provider, workflow_path=parent_path)
 
-        with pytest.raises(ExecutionError, match="Circular sub-workflow reference"):
+        # Self-reference is now allowed but will hit depth limit
+        with pytest.raises(ExecutionError, match="depth limit exceeded"):
+            await engine.run({})
+
+    @pytest.mark.asyncio
+    async def test_max_depth_per_agent(self, tmp_workflow_dir: Path) -> None:
+        """Test that per-agent max_depth is enforced before global limit."""
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        _write_yaml(
+            parent_path,
+            """\
+            workflow:
+              name: self-ref
+              entry_point: sub_wf
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 50
+            agents:
+              - name: sub_wf
+                type: workflow
+                workflow: parent.yaml
+                max_depth: 2
+                routes:
+                  - to: "$end"
+            output: {}
+            """,
+        )
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="parent.yaml",
+                    max_depth=2,
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        mock_provider = MagicMock()
+        engine = WorkflowEngine(config, mock_provider, workflow_path=parent_path)
+
+        with pytest.raises(ExecutionError, match="max_depth.*exceeded"):
             await engine.run({})
 
 
@@ -525,3 +595,88 @@ class TestSubWorkflowIterationCounting:
         await engine.run({})
 
         assert engine.limits.current_iteration == 1
+
+
+class TestSubWorkflowForEach:
+    """Tests for sub-workflows executed inside for-each groups."""
+
+    @pytest.mark.asyncio
+    async def test_for_each_subworkflow_passes_context(self, tmp_workflow_dir: Path) -> None:
+        """Test that for-each + sub-workflow doesn't crash with NameError.
+
+        Regression test: _execute_subworkflow_with_inputs previously referenced
+        an undefined ``context`` variable, causing NameError when for-each groups
+        dispatched sub-workflows.
+        """
+        from conductor.config.schema import ForEachDef
+
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: item-processor
+              entry_point: process
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: process
+                prompt: "Process {{ workflow.input.item }}"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ process.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent-for-each",
+                entry_point="source_agent",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=20),
+            ),
+            agents=[
+                AgentDef(
+                    name="source_agent",
+                    prompt="Return a list of items",
+                    routes=[RouteDef(to="process_items")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="process_items",
+                    type="for_each",
+                    source="source_agent.output.items",
+                    **{"as": "item"},
+                    agent=AgentDef(
+                        name="item_worker",
+                        type="workflow",
+                        workflow="sub.yaml",
+                        input_mapping={"item": "{{ item }}"},
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        call_count = 0
+
+        def mock_handler(agent, prompt, context):
+            nonlocal call_count
+            call_count += 1
+            if agent.name == "source_agent":
+                return {"items": ["alpha", "beta"]}
+            return {"result": f"processed-{call_count}"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+        result = await engine.run({})
+
+        # The for-each should have spawned 2 sub-workflows (one per item)
+        assert call_count == 3  # 1 source + 2 sub-workflow inner agents

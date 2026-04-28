@@ -30,6 +30,9 @@ class TestWorkflowContextBasic:
         assert ctx.agent_outputs == {}
         assert ctx.current_iteration == 0
         assert ctx.execution_history == []
+        assert ctx.workflow_dir == ""
+        assert ctx.workflow_file == ""
+        assert ctx.workflow_name == ""
 
     def test_set_workflow_inputs(self) -> None:
         """Test setting workflow inputs."""
@@ -151,6 +154,50 @@ class TestWorkflowContextLastOnlyMode:
         assert "context" in agent_ctx
 
 
+class TestWorkflowContextMetadata:
+    """Tests for workflow metadata (dir, file, name) in context."""
+
+    def test_workflow_dir_file_name_in_accumulate_context(self) -> None:
+        """Test workflow.dir, workflow.file, workflow.name available in accumulate mode."""
+        ctx = WorkflowContext(
+            workflow_dir="/home/user/workflows",
+            workflow_file="/home/user/workflows/main.yaml",
+            workflow_name="my-workflow",
+        )
+        ctx.set_workflow_inputs({"key": "val"})
+
+        agent_ctx = ctx.build_for_agent("agent", [], mode="accumulate")
+
+        assert agent_ctx["workflow"]["dir"] == "/home/user/workflows"
+        assert agent_ctx["workflow"]["file"] == "/home/user/workflows/main.yaml"
+        assert agent_ctx["workflow"]["name"] == "my-workflow"
+        assert agent_ctx["workflow"]["input"] == {"key": "val"}
+
+    def test_workflow_metadata_in_explicit_mode(self) -> None:
+        """Test workflow.dir/file/name available in explicit mode (not filtered)."""
+        ctx = WorkflowContext(
+            workflow_dir="/registry/twig",
+            workflow_file="/registry/twig/sdlc.yaml",
+            workflow_name="twig-sdlc",
+        )
+
+        agent_ctx = ctx.build_for_agent("agent", [], mode="explicit")
+
+        assert agent_ctx["workflow"]["dir"] == "/registry/twig"
+        assert agent_ctx["workflow"]["file"] == "/registry/twig/sdlc.yaml"
+        assert agent_ctx["workflow"]["name"] == "twig-sdlc"
+
+    def test_empty_metadata_omitted(self) -> None:
+        """Test that empty workflow metadata fields are not included."""
+        ctx = WorkflowContext()
+
+        agent_ctx = ctx.build_for_agent("agent", [], mode="accumulate")
+
+        assert "dir" not in agent_ctx["workflow"]
+        assert "file" not in agent_ctx["workflow"]
+        assert "name" not in agent_ctx["workflow"]
+
+
 class TestWorkflowContextExplicitMode:
     """Tests for explicit context mode."""
 
@@ -218,6 +265,49 @@ class TestWorkflowContextExplicitMode:
                 ["workflow.input.missing"],
                 mode="explicit",
             )
+
+    def test_explicit_mode_workflow_input_all(self) -> None:
+        """Test explicit mode with 2-part workflow.input injects all inputs."""
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"question": "What?", "mode": "fast", "count": 3})
+
+        agent_ctx = ctx.build_for_agent(
+            "agent",
+            ["workflow.input"],
+            mode="explicit",
+        )
+
+        assert agent_ctx["workflow"]["input"]["question"] == "What?"
+        assert agent_ctx["workflow"]["input"]["mode"] == "fast"
+        assert agent_ctx["workflow"]["input"]["count"] == 3
+
+    def test_explicit_mode_workflow_input_all_with_individual(self) -> None:
+        """Test 2-part workflow.input merges with individual 3-part refs."""
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"question": "What?", "mode": "fast"})
+
+        # Mix individual and all-inputs refs
+        agent_ctx = ctx.build_for_agent(
+            "agent",
+            ["workflow.input.question", "workflow.input"],
+            mode="explicit",
+        )
+
+        assert agent_ctx["workflow"]["input"]["question"] == "What?"
+        assert agent_ctx["workflow"]["input"]["mode"] == "fast"
+
+    def test_explicit_mode_workflow_input_all_optional(self) -> None:
+        """Test 2-part workflow.input? with no inputs doesn't raise."""
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({})
+
+        agent_ctx = ctx.build_for_agent(
+            "agent",
+            ["workflow.input?"],
+            mode="explicit",
+        )
+
+        assert agent_ctx["workflow"]["input"] == {}
 
 
 class TestWorkflowContextOptionalDeps:

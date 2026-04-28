@@ -40,6 +40,34 @@ _STATIC_DIR = Path(__file__).parent / "static"
 # Grace period (seconds) before auto-shutdown in --web-bg mode
 _BG_GRACE_SECONDS = 30
 
+# File API: allowed text extensions and max file size
+_FILE_ALLOWED_EXTENSIONS = frozenset(
+    {
+        ".md",
+        ".txt",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".log",
+        ".py",
+        ".ts",
+        ".js",
+        ".tsx",
+        ".jsx",
+        ".css",
+        ".html",
+        ".toml",
+        ".cfg",
+        ".ini",
+        ".csv",
+        ".xml",
+        ".sh",
+        ".bat",
+        ".ps1",
+    }
+)
+_FILE_MAX_SIZE = 1 * 1024 * 1024  # 1 MB
+
 
 class WebDashboard:
     """Real-time web dashboard for workflow visualization.
@@ -63,11 +91,13 @@ class WebDashboard:
         host: str = "127.0.0.1",
         port: int = 0,
         bg: bool = False,
+        workflow_root: Path | None = None,
     ) -> None:
         self._emitter = emitter
         self._host = host
         self._port = port
         self._bg = bg
+        self._workflow_root = workflow_root.resolve() if workflow_root else None
 
         # State
         self._event_history: list[dict[str, Any]] = []
@@ -106,6 +136,7 @@ class WebDashboard:
         self._serve_task: asyncio.Task[None] | None = None
         self._broadcast_task: asyncio.Task[None] | None = None
         self._actual_port: int | None = None
+        self._original_exception_handler: Any = None
 
         # Build FastAPI app
         self._app = self._create_app()
@@ -156,6 +187,25 @@ class WebDashboard:
         async def get_state() -> JSONResponse:
             return JSONResponse(content=self._event_history)
 
+        @app.get("/api/info")
+        async def get_info() -> JSONResponse:
+            """Return run identity for dashboard linking."""
+            # Extract from first workflow_started event
+            info: dict[str, Any] = {}
+            for event in self._event_history:
+                if event.get("type") == "workflow_started":
+                    data = event.get("data", {})
+                    info = {
+                        "run_id": data.get("run_id", ""),
+                        "log_file": data.get("log_file", ""),
+                        "workflow_name": data.get("name", ""),
+                        "started_at": event.get("timestamp", 0),
+                        "metadata": data.get("metadata", {}),
+                        "system": data.get("system", {}),
+                    }
+                    break
+            return JSONResponse(content=info)
+
         @app.get("/api/logs")
         async def download_logs() -> JSONResponse:
             """Download the full event history as a JSON file."""
@@ -193,6 +243,81 @@ class WebDashboard:
             """Resume a paused agent after it was interrupted by ``POST /api/stop``."""
             self._resume_event.set()
             return JSONResponse({"status": "resuming"})
+
+        @app.get("/api/files/{file_path:path}")
+        async def get_file(file_path: str) -> JSONResponse:
+            """Serve a local file relative to the workflow root directory.
+
+            Used by the web dashboard to render files linked in human gate
+            Markdown prompts (e.g. ``[plan](./plans/design.md)``).
+
+            Security: rejects absolute paths, path traversal, disallowed
+            extensions, and files larger than 1 MB.
+            """
+            if self._workflow_root is None:
+                return JSONResponse(
+                    {"error": "No workflow root configured"},
+                    status_code=404,
+                )
+
+            # Reject absolute, drive-qualified, UNC, and scheme-prefixed paths
+            if (
+                file_path.startswith(("/", "\\"))
+                or "://" in file_path
+                or (len(file_path) >= 2 and file_path[1] == ":")
+            ):
+                return JSONResponse(
+                    {"error": "Absolute paths are not allowed"},
+                    status_code=403,
+                )
+
+            try:
+                target = (self._workflow_root / file_path).resolve(strict=True)
+            except (OSError, ValueError):
+                return JSONResponse({"error": "File not found"}, status_code=404)
+
+            # Containment check — target must be inside workflow root
+            try:
+                target.relative_to(self._workflow_root)
+            except ValueError:
+                return JSONResponse(
+                    {"error": "Access denied — path outside workflow directory"},
+                    status_code=403,
+                )
+
+            # Extension allowlist
+            if target.suffix.lower() not in _FILE_ALLOWED_EXTENSIONS:
+                return JSONResponse(
+                    {"error": f"File type '{target.suffix}' is not supported"},
+                    status_code=403,
+                )
+
+            # Size check
+            file_size = target.stat().st_size
+            if file_size > _FILE_MAX_SIZE:
+                return JSONResponse(
+                    {"error": f"File too large ({file_size:,} bytes, max {_FILE_MAX_SIZE:,})"},
+                    status_code=413,
+                )
+
+            # Read as text
+            try:
+                content = target.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError) as e:
+                return JSONResponse(
+                    {"error": f"Cannot read file: {e}"},
+                    status_code=422,
+                )
+
+            rel_path = str(target.relative_to(self._workflow_root)).replace("\\", "/")
+            return JSONResponse(
+                {
+                    "path": rel_path,
+                    "content": content,
+                    "size": file_size,
+                    "extension": target.suffix.lower(),
+                }
+            )
 
         @app.websocket("/ws")
         async def websocket_endpoint(ws: WebSocket) -> None:
@@ -369,12 +494,82 @@ class WebDashboard:
     # Server lifecycle
     # ------------------------------------------------------------------
 
+    def _is_proactor_shutdown_race(self, context: dict[str, Any]) -> bool:
+        """Check if an exception context matches the proactor accept-loop race.
+
+        On Windows with Python 3.14+, the proactor event loop's accept
+        callback can fire after ``Server.close()`` sets ``_sockets = None``,
+        causing ``AssertionError`` in ``base_events.py:_attach``.  This is
+        benign during shutdown — the server is already closing and does not
+        need new connections.
+
+        Returns True only when all of:
+        - The exception is ``AssertionError``
+        - The uvicorn server is in shutdown state (``should_exit`` is set)
+        - The traceback (if available) originates from asyncio internals
+        """
+        exc = context.get("exception")
+        if not isinstance(exc, AssertionError):
+            return False
+        if self._server is None or not getattr(self._server, "should_exit", False):
+            return False
+        # Extra safety: check traceback originates from asyncio, not user code
+        import traceback as tb_mod
+
+        tb = exc.__traceback__
+        if tb is not None:
+            frames = tb_mod.extract_tb(tb)
+            if frames and "asyncio" in frames[-1].filename:
+                return True
+        # If no traceback but server is shutting down, still suppress —
+        # the only known source of AssertionError during shutdown is this race.
+        return True
+
+    def _loop_exception_handler(
+        self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]
+    ) -> None:
+        """Custom event-loop exception handler that suppresses the proactor race."""
+        if self._is_proactor_shutdown_race(context):
+            logger.debug(
+                "Suppressed proactor accept-loop race during server shutdown: %s",
+                context.get("message", ""),
+            )
+            return
+        # Delegate to the original handler (or the default)
+        if self._original_exception_handler is not None:
+            self._original_exception_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    async def _guarded_serve(self) -> None:
+        """Run ``uvicorn.Server.serve()`` with a guard for the proactor race.
+
+        If ``serve()`` itself raises ``AssertionError`` during shutdown
+        (rather than the exception surfacing through a callback), this
+        wrapper suppresses it.
+        """
+        try:
+            await self._server.serve()
+        except AssertionError:
+            if self._server is not None and getattr(self._server, "should_exit", False):
+                logger.debug(
+                    "Suppressed proactor accept-loop AssertionError during server shutdown"
+                )
+            else:
+                raise
+
     async def start(self) -> None:
         """Start the uvicorn server as an asyncio task.
 
         The broadcaster is started automatically via the FastAPI lifespan.
         Waits until the server socket is bound and the actual port is
         known before returning.
+
+        On Windows with Python 3.14+, installs a custom event-loop
+        exception handler to suppress the proactor accept-loop race
+        (``AssertionError: self._sockets is not None``) that can fire
+        when a new connection is accepted after ``Server.close()`` sets
+        ``_sockets = None`` during shutdown.
         """
         import uvicorn
 
@@ -386,8 +581,15 @@ class WebDashboard:
         )
         self._server = uvicorn.Server(config)
 
+        # Install a guarded exception handler to suppress the proactor
+        # accept-race AssertionError that occurs on Windows (Python 3.14+)
+        # when the server is shutting down.
+        loop = asyncio.get_running_loop()
+        self._original_exception_handler = loop.get_exception_handler()
+        loop.set_exception_handler(self._loop_exception_handler)
+
         # Launch server (broadcaster starts via app lifespan)
-        self._serve_task = asyncio.create_task(self._server.serve())
+        self._serve_task = asyncio.create_task(self._guarded_serve())
 
         # Wait for server to bind — poll until .started is set
         while not self._server.started:
@@ -429,6 +631,13 @@ class WebDashboard:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._serve_task
             self._serve_task = None
+
+        # Restore the original event-loop exception handler
+        try:
+            loop = asyncio.get_running_loop()
+            loop.set_exception_handler(self._original_exception_handler)
+        except RuntimeError:
+            pass  # No running loop (e.g. during interpreter shutdown)
 
         # Close remaining WebSocket connections
         for ws in list(self._connections):

@@ -78,6 +78,18 @@ class WorkflowContext:
     workflow_inputs: dict[str, Any] = field(default_factory=dict)
     """Inputs provided at workflow start."""
 
+    workflow_dir: str = ""
+    """Directory containing the workflow YAML file (resolved absolute path).
+    Available in templates as ``{{ workflow.dir }}``."""
+
+    workflow_file: str = ""
+    """Absolute path to the workflow YAML file.
+    Available in templates as ``{{ workflow.file }}``."""
+
+    workflow_name: str = ""
+    """Name of the workflow from the YAML config.
+    Available in templates as ``{{ workflow.name }}``."""
+
     agent_outputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     """Outputs from executed agents, keyed by agent name."""
 
@@ -161,11 +173,20 @@ class WorkflowContext:
         Raises:
             KeyError: If explicit mode is used and a required (non-optional) input is missing.
         """
+        # Build workflow metadata available in all modes
+        workflow_meta: dict[str, Any] = {}
+        if self.workflow_dir:
+            workflow_meta["dir"] = self.workflow_dir
+        if self.workflow_file:
+            workflow_meta["file"] = self.workflow_file
+        if self.workflow_name:
+            workflow_meta["name"] = self.workflow_name
+
         # For explicit mode, start with empty workflow inputs
         # For other modes, include all workflow inputs
         if mode == "explicit":
             ctx: dict[str, Any] = {
-                "workflow": {"input": {}},
+                "workflow": {"input": {}, **workflow_meta},
                 "context": {
                     "iteration": self.current_iteration,
                     "history": self.execution_history.copy(),
@@ -176,7 +197,7 @@ class WorkflowContext:
                 self._add_explicit_input(ctx, input_ref)
         else:
             ctx = {
-                "workflow": {"input": self.workflow_inputs.copy()},
+                "workflow": {"input": self.workflow_inputs.copy(), **workflow_meta},
                 "context": {
                     "iteration": self.current_iteration,
                     "history": self.execution_history.copy(),
@@ -254,8 +275,8 @@ class WorkflowContext:
             return
 
         if parts[0] == "workflow":
-            # workflow.input.param_name format
             if len(parts) >= 3 and parts[1] == "input":
+                # workflow.input.param_name — inject a single workflow input
                 param_name = parts[2]
                 # Ensure workflow.input exists in ctx
                 if "workflow" not in ctx:
@@ -270,6 +291,14 @@ class WorkflowContext:
                     ctx["workflow"]["input"][param_name] = None
                 else:
                     raise KeyError(f"Missing required workflow input: {param_name}")
+            elif len(parts) == 2 and parts[1] == "input":
+                # workflow.input — inject ALL workflow inputs (merge to preserve
+                # any individual refs already processed)
+                if "workflow" not in ctx:
+                    ctx["workflow"] = {"input": {}}
+                elif "input" not in ctx["workflow"]:
+                    ctx["workflow"]["input"] = {}
+                ctx["workflow"]["input"].update(self.workflow_inputs)
         else:
             # Could be agent_name.output or parallel_group.outputs
             entity_name = parts[0]
