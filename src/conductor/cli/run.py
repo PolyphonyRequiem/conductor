@@ -1025,7 +1025,7 @@ async def run_workflow_async(
             host="127.0.0.1",
             port=web_port,
             bg=bg_mode,
-            workflow_root=Path(workflow_path).resolve().parent,
+            workflow_root=Path.cwd(),
         )
 
         try:

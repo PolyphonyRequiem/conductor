@@ -950,7 +950,7 @@ class WorkflowEngine:
         """
         # If no web dashboard at all, use CLI only.
         if self._web_dashboard is None:
-            gate_base = Path(self.workflow_path).resolve().parent if self.workflow_path else None
+            gate_base = Path.cwd()
             return await self.gate_handler.handle_gate(agent, agent_context, base_dir=gate_base)
 
         # Race CLI vs web input. We start the web task unconditionally (not only
@@ -959,7 +959,7 @@ class WorkflowEngine:
         # If we bail early when ``has_connections()`` is False, a later click
         # in the dashboard pushes a message to ``_gate_response_queue`` that
         # nobody is awaiting, and the workflow hangs forever.
-        gate_base = Path(self.workflow_path).resolve().parent if self.workflow_path else None
+        gate_base = Path.cwd()
         cli_task = asyncio.create_task(
             self.gate_handler.handle_gate(agent, agent_context, base_dir=gate_base),
             name="gate_cli",
@@ -1565,11 +1565,7 @@ class WorkflowEngine:
 
                             # Render prompt and auto-linkify paths/URLs for markdown display
                             rendered_prompt = self.renderer.render(agent.prompt, agent_context)
-                            gate_base_dir = (
-                                Path(self.workflow_path).resolve().parent
-                                if self.workflow_path
-                                else None
-                            )
+                            gate_base_dir = Path.cwd()
                             rendered_prompt = linkify_markdown(
                                 rendered_prompt, base_dir=gate_base_dir
                             )
