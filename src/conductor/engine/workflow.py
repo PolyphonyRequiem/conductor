@@ -546,17 +546,21 @@ class WorkflowEngine:
 
         # Build sub-workflow inputs from the parent context
         sub_inputs: dict[str, Any]
-        if agent.input_mapping:
+        if agent.input_mapping is not None:
             # Dynamic inputs: render each Jinja2 expression against parent context
             renderer = TemplateRenderer()
             sub_inputs = {}
             for key, template_expr in agent.input_mapping.items():
-                rendered = renderer.render(template_expr, context)
-                # Attempt to parse rendered values as JSON for non-string types
                 try:
-                    sub_inputs[key] = json.loads(rendered)
-                except (json.JSONDecodeError, ValueError):
-                    sub_inputs[key] = rendered
+                    rendered = renderer.render(template_expr, context)
+                except Exception as e:
+                    raise ExecutionError(
+                        f"Failed to render input_mapping key '{key}' for agent "
+                        f"'{agent.name}': {e}",
+                        suggestion=f"Check that the expression '{template_expr}' "
+                        "references valid context variables.",
+                    ) from e
+                sub_inputs[key] = rendered
         else:
             # Default: forward parent's workflow.input.* values
             workflow_ctx = context.get("workflow", {})
@@ -577,14 +581,6 @@ class WorkflowEngine:
             web_dashboard=self._web_dashboard,
             _subworkflow_depth=self._subworkflow_depth + 1,
         )
-
-        # Inject parent agent outputs into the child workflow's context.
-        # This allows sub-workflow agents that declare parent agents in their
-        # input: list (e.g., task_manager.output?) to access parent state
-        # even when input_mapping doesn't cover all fields.
-        for key, value in context.items():
-            if key not in ("workflow", "context") and isinstance(value, dict):
-                child_engine.context.agent_outputs[key] = value.get("output", value)
 
         return await child_engine.run(sub_inputs)
 

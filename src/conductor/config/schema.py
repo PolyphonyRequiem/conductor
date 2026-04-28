@@ -547,7 +547,7 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents require 'options'")
             if not self.prompt:
                 raise ValueError("human_gate agents require 'prompt'")
-            if self.input_mapping:
+            if self.input_mapping is not None:
                 raise ValueError("human_gate agents cannot have 'input_mapping'")
         elif self.type == "script":
             if not self.command:
@@ -575,7 +575,7 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'max_agent_iterations'")
             if self.retry is not None:
                 raise ValueError("script agents cannot have 'retry'")
-            if self.input_mapping:
+            if self.input_mapping is not None:
                 raise ValueError("script agents cannot have 'input_mapping'")
         elif self.type == "workflow":
             if not self.workflow:
@@ -602,7 +602,7 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'retry'")
         else:
             # Regular agent or human_gate — input_mapping is not valid
-            if self.input_mapping:
+            if self.input_mapping is not None:
                 raise ValueError(
                     f"'{self.type or 'agent'}' agents cannot have 'input_mapping' "
                     "(only workflow agents support input_mapping)"
