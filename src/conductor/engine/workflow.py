@@ -555,8 +555,7 @@ class WorkflowEngine:
                     rendered = renderer.render(template_expr, context)
                 except Exception as e:
                     raise ExecutionError(
-                        f"Failed to render input_mapping key '{key}' for agent "
-                        f"'{agent.name}': {e}",
+                        f"Failed to render input_mapping key '{key}' for agent '{agent.name}': {e}",
                         suggestion=f"Check that the expression '{template_expr}' "
                         "references valid context variables.",
                     ) from e
