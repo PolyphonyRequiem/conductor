@@ -126,7 +126,7 @@ def validate_workflow_config(
         if (
             agent.tools is not None
             and agent.tools
-            and agent.type not in ("script", "team")
+            and agent.type != "script"
             and (config.tools or not has_mcp_servers)
         ):
             tool_errors = _validate_tool_references(agent.name, agent.tools, set(config.tools))
@@ -137,13 +137,13 @@ def validate_workflow_config(
         parallel_errors = _validate_parallel_groups(config)
         errors.extend(parallel_errors)
 
-    # Validate for_each groups: reject script and team steps as inline agents
+    # Validate for_each groups: reject script steps as inline agents
     for for_each_group in config.for_each:
-        if for_each_group.agent.type in ("script", "team"):
+        if for_each_group.agent.type == "script":
             errors.append(
-                f"For-each group '{for_each_group.name}' uses a {for_each_group.agent.type} "
+                f"For-each group '{for_each_group.name}' uses a script "
                 "step as its inline agent. "
-                f"{for_each_group.agent.type.title()} steps cannot be used in for_each groups."
+                "Script steps cannot be used in for_each groups."
             )
 
     # Validate workflow output references
@@ -418,12 +418,6 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                     "Workflow steps cannot be used in parallel groups."
                 )
 
-            # Validate no team agents in parallel groups
-            if agent.type == "team":
-                errors.append(
-                    f"Agent '{agent_name}' in parallel group '{pg.name}' is a team agent. "
-                    "Team agents cannot be used in parallel groups."
-                )
 
         # PE-6.2: Validate parallel group route targets
         for_each_names = {fe.name for fe in config.for_each}
