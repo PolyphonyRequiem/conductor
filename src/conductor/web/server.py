@@ -319,6 +319,72 @@ class WebDashboard:
                 }
             )
 
+        @app.post("/api/open-file")
+        async def open_file_in_editor(request_body: dict[str, str]) -> JSONResponse:
+            """Open a file in the system default editor.
+
+            Accepts a relative file path and opens it using the OS default
+            application (e.g., ``xdg-open`` on Linux, ``open`` on macOS,
+            ``os.startfile`` on Windows).
+
+            Security: same containment checks as the file read endpoint.
+            """
+            import subprocess
+            import sys
+
+            file_path = request_body.get("path", "")
+            if not file_path:
+                return JSONResponse({"error": "Missing 'path' field"}, status_code=400)
+
+            if self._workflow_root is None:
+                return JSONResponse(
+                    {"error": "No workflow root configured"},
+                    status_code=404,
+                )
+
+            # Reject absolute paths
+            if (
+                file_path.startswith(("/", "\\"))
+                or "://" in file_path
+                or (len(file_path) >= 2 and file_path[1] == ":")
+            ):
+                return JSONResponse(
+                    {"error": "Absolute paths are not allowed"},
+                    status_code=403,
+                )
+
+            try:
+                target = (self._workflow_root / file_path).resolve(strict=True)
+            except (OSError, ValueError):
+                return JSONResponse({"error": "File not found"}, status_code=404)
+
+            # Containment check
+            try:
+                target.relative_to(self._workflow_root)
+            except ValueError:
+                return JSONResponse(
+                    {"error": "Access denied — path outside workflow directory"},
+                    status_code=403,
+                )
+
+            # Open with system default editor
+            try:
+                if sys.platform == "win32":
+                    import os
+
+                    os.startfile(target)  # noqa: S606
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", str(target)])  # noqa: S603, S607
+                else:
+                    subprocess.Popen(["xdg-open", str(target)])  # noqa: S603, S607
+            except OSError as e:
+                return JSONResponse(
+                    {"error": f"Failed to open file: {e}"},
+                    status_code=500,
+                )
+
+            return JSONResponse({"status": "ok", "path": str(target)})
+
         @app.websocket("/ws")
         async def websocket_endpoint(ws: WebSocket) -> None:
             await ws.accept()

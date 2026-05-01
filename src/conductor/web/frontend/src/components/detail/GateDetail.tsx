@@ -391,15 +391,23 @@ function PromptMarkdown({
             <strong className="font-semibold">{children}</strong>
           ),
           em: ({ children }) => <em className="italic">{children}</em>,
-          // Links — open relative file links in VSCode
+          // Links — open relative file links in default editor
           a: ({ href, children }) => {
             if (isRelativeFileLink(href)) {
-              const vscodeUrl = `vscode://file/${href}`;
+              const handleOpenInEditor = (e: React.MouseEvent) => {
+                e.preventDefault();
+                fetch('/api/open-file', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ path: href }),
+                });
+              };
               return (
                 <a
-                  href={vscodeUrl}
+                  href="#"
+                  onClick={handleOpenInEditor}
                   className="inline-flex items-center gap-0.5 text-blue-400 hover:text-blue-300 underline underline-offset-2"
-                  title={`Open ${href} in VSCode`}
+                  title={`Open ${href} in default editor`}
                 >
                   <FileText className="w-3 h-3 inline flex-shrink-0" />
                   {children}

@@ -223,6 +223,7 @@ interface WorkflowState {
   workflowYaml: string | null;
   conductorVersion: string | null;
   entryPoint: string | null;
+  workflowRoot: string | null;
 
   // Graph structure
   agents: WorkflowAgent[];
@@ -416,6 +417,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   workflowYaml: null,
   conductorVersion: null,
   entryPoint: null,
+  workflowRoot: null,
   agents: [],
   routes: [],
   parallelGroups: [],
@@ -775,6 +777,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       state.workflowYaml = (_data as Record<string, unknown>).yaml_source as string ?? null;
       state.conductorVersion = (_data as Record<string, unknown>).version as string ?? null;
       state.entryPoint = data.entry_point || null;
+      state.workflowRoot = data.workflow_root || null;
       state.agents = data.agents || [];
       state.routes = data.routes || [];
       state.parallelGroups = data.parallel_groups || [];

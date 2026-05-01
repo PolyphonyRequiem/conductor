@@ -1355,6 +1355,7 @@ class WorkflowEngine:
                             for r in f.routes
                         ],
                         **self._yaml_source_field(),
+                        "workflow_root": str(Path.cwd()),
                         "metadata": self.config.workflow.metadata,
                         "system": self._build_system_metadata(),
                         "run_id": self._run_id,
