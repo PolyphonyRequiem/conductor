@@ -610,11 +610,27 @@ class WorkflowEngine:
             ) from exc
 
         # Build sub-workflow inputs from the parent context
-        # Extract workflow.input.* values from the parent context
-        workflow_ctx = context.get("workflow", {})
-        sub_inputs: dict[str, Any] = (
-            dict(workflow_ctx.get("input", {})) if isinstance(workflow_ctx, dict) else {}
-        )
+        sub_inputs: dict[str, Any]
+        if agent.input_mapping is not None:
+            # Dynamic inputs: render each Jinja2 expression against parent context
+            renderer = TemplateRenderer()
+            sub_inputs = {}
+            for key, template_expr in agent.input_mapping.items():
+                try:
+                    rendered = renderer.render(template_expr, context)
+                except Exception as e:
+                    raise ExecutionError(
+                        f"Failed to render input_mapping key '{key}' for agent '{agent.name}': {e}",
+                        suggestion=f"Check that the expression '{template_expr}' "
+                        "references valid context variables.",
+                    ) from e
+                sub_inputs[key] = rendered
+        else:
+            # Default: forward parent's workflow.input.* values
+            workflow_ctx = context.get("workflow", {})
+            sub_inputs = (
+                dict(workflow_ctx.get("input", {})) if isinstance(workflow_ctx, dict) else {}
+            )
 
         # Create child engine inheriting provider/registry but with deeper depth
         child_engine = WorkflowEngine(
