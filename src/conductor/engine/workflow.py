@@ -33,6 +33,7 @@ from conductor.exceptions import (
     TimeoutError as ConductorTimeoutError,
 )
 from conductor.executor.agent import AgentExecutor
+from conductor.executor.linkify import linkify_markdown
 from conductor.executor.script import ScriptExecutor, ScriptOutput
 from conductor.executor.template import TemplateRenderer
 from conductor.gates.human import (
@@ -406,6 +407,11 @@ class WorkflowEngine:
         # outgoing events so the frontend can resolve the owning context
         # without inferring parentage from activeContextPath.
         self._dashboard_context_path: list[str] = list(_dashboard_context_path or [])
+
+    @property
+    def _workflow_dir(self) -> Path | None:
+        """Resolved parent directory of the workflow file, or None if unset."""
+        return Path(self.workflow_path).resolve().parent if self.workflow_path else None
 
     def _build_pricing_overrides(self) -> dict[str, ModelPricing] | None:
         """Build pricing overrides from workflow cost configuration.
@@ -1053,7 +1059,9 @@ class WorkflowEngine:
         """
         # If no web dashboard at all, use CLI only.
         if self._web_dashboard is None:
-            return await self.gate_handler.handle_gate(agent, agent_context)
+            return await self.gate_handler.handle_gate(
+                agent, agent_context, base_dir=self._workflow_dir
+            )
 
         # Race CLI vs web input. We start the web task unconditionally (not only
         # when a client is currently connected), because the human often opens
@@ -1062,7 +1070,7 @@ class WorkflowEngine:
         # in the dashboard pushes a message to ``_gate_response_queue`` that
         # nobody is awaiting, and the workflow hangs forever.
         cli_task = asyncio.create_task(
-            self.gate_handler.handle_gate(agent, agent_context),
+            self.gate_handler.handle_gate(agent, agent_context, base_dir=self._workflow_dir),
             name="gate_cli",
         )
         web_task = asyncio.create_task(
@@ -1152,12 +1160,6 @@ class WorkflowEngine:
         if self._interrupt_event is None or not self._interrupt_event.is_set():
             return None
 
-        # Clearing here is safe because is_set() above is the only consumer
-        # within this method; the unwind path raised below does NOT re-check
-        # the event before reaching the parent engine. If a future change
-        # adds a between-agent recheck after the InterruptError catch, this
-        # clear must move to AFTER the raise to preserve interrupt visibility.
-        # Issue #145 (S2).
         self._interrupt_event.clear()
 
         # In web mode, the interrupt was already handled at the provider level
@@ -1778,13 +1780,19 @@ class WorkflowEngine:
                                 for o in (agent.options or [])
                             ]
 
+                            # Render prompt and auto-linkify paths/URLs for markdown display
+                            rendered_prompt = self.renderer.render(agent.prompt, agent_context)
+                            rendered_prompt = linkify_markdown(
+                                rendered_prompt, base_dir=self._workflow_dir
+                            )
+
                             self._emit(
                                 "gate_presented",
                                 {
                                     "agent_name": agent.name,
                                     "options": [o.value for o in (agent.options or [])],
                                     "option_details": gate_options_data,
-                                    "prompt": self.renderer.render(agent.prompt, agent_context),
+                                    "prompt": rendered_prompt,
                                 },
                             )
 

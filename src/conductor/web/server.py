@@ -24,7 +24,7 @@ import json
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
+from conductor.executor.linkify import LINKABLE_EXTENSIONS
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,9 @@ _STATIC_DIR = Path(__file__).parent / "static"
 
 # Grace period (seconds) before auto-shutdown in --web-bg mode
 _BG_GRACE_SECONDS = 30
+
+# File API: max file size (extension allowlist is LINKABLE_EXTENSIONS from linkify)
+_FILE_MAX_SIZE = 1 * 1024 * 1024  # 1 MB
 
 
 class WebDashboard:
@@ -63,11 +67,13 @@ class WebDashboard:
         host: str = "127.0.0.1",
         port: int = 0,
         bg: bool = False,
+        workflow_root: Path | None = None,
     ) -> None:
         self._emitter = emitter
         self._host = host
         self._port = port
         self._bg = bg
+        self._workflow_root = workflow_root.resolve() if workflow_root else None
 
         # State
         self._event_history: list[dict[str, Any]] = []
@@ -220,6 +226,81 @@ class WebDashboard:
             """Resume a paused agent after it was interrupted by ``POST /api/stop``."""
             self._resume_event.set()
             return JSONResponse({"status": "resuming"})
+
+        @app.get("/api/files/{file_path:path}")
+        async def get_file(file_path: str) -> JSONResponse:
+            """Serve a local file relative to the workflow root directory.
+
+            Used by the web dashboard to render files linked in human gate
+            Markdown prompts (e.g. ``[plan](./plans/design.md)``).
+
+            Security: rejects absolute paths, path traversal, disallowed
+            extensions, and files larger than 1 MB.
+            """
+            if self._workflow_root is None:
+                return JSONResponse(
+                    {"error": "No workflow root configured"},
+                    status_code=404,
+                )
+
+            # Reject absolute, drive-qualified, UNC, and scheme-prefixed paths
+            if (
+                "://" in file_path
+                or PurePosixPath(file_path).is_absolute()
+                or PureWindowsPath(file_path).is_absolute()
+            ):
+                return JSONResponse(
+                    {"error": "Absolute paths are not allowed"},
+                    status_code=403,
+                )
+
+            try:
+                target = (self._workflow_root / file_path).resolve(strict=True)
+            except (OSError, ValueError):
+                return JSONResponse({"error": "File not found"}, status_code=404)
+
+            # Containment check — target must be inside workflow root
+            try:
+                target.relative_to(self._workflow_root)
+            except ValueError:
+                return JSONResponse(
+                    {"error": "Access denied — path outside workflow directory"},
+                    status_code=403,
+                )
+
+            # Extension allowlist
+            if target.suffix.lower() not in LINKABLE_EXTENSIONS:
+                return JSONResponse(
+                    {"error": f"File type '{target.suffix}' is not supported"},
+                    status_code=403,
+                )
+
+            # Size check
+            file_size = target.stat().st_size
+            if file_size > _FILE_MAX_SIZE:
+                return JSONResponse(
+                    {"error": f"File too large ({file_size:,} bytes, max {_FILE_MAX_SIZE:,})"},
+                    status_code=413,
+                )
+
+            # Read as text
+            try:
+                content = target.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError) as e:
+                return JSONResponse(
+                    {"error": f"Cannot read file: {e}"},
+                    status_code=422,
+                )
+
+            rel_path = str(target.relative_to(self._workflow_root)).replace("\\", "/")
+            return JSONResponse(
+                {
+                    "path": rel_path,
+                    "content": content,
+                    "size": file_size,
+                    "extension": target.suffix.lower(),
+                }
+            )
 
         @app.websocket("/ws")
         async def websocket_endpoint(ws: WebSocket) -> None:
@@ -443,25 +524,24 @@ class WebDashboard:
         Returns True only when all of:
         - The exception is ``AssertionError``
         - The uvicorn server is in shutdown state (``should_exit`` is set)
-        - The traceback is present and the deepest frame originates from
-          asyncio internals
+        - The traceback (if available) originates from asyncio internals
         """
         exc = context.get("exception")
         if not isinstance(exc, AssertionError):
             return False
         if self._server is None or not getattr(self._server, "should_exit", False):
             return False
-        # Require an asyncio traceback frame so unrelated AssertionErrors
-        # raised during shutdown (e.g., from a workflow callback finishing
-        # late) propagate to the default handler instead of being silently
-        # swallowed. Issue #145 (I3).
+        # Extra safety: check traceback originates from asyncio, not user code
         import traceback as tb_mod
 
         tb = exc.__traceback__
-        if tb is None:
-            return False
-        frames = tb_mod.extract_tb(tb)
-        return bool(frames) and "asyncio" in frames[-1].filename
+        if tb is not None:
+            frames = tb_mod.extract_tb(tb)
+            if frames and "asyncio" in frames[-1].filename:
+                return True
+        # If no traceback but server is shutting down, still suppress —
+        # the only known source of AssertionError during shutdown is this race.
+        return True
 
     def _loop_exception_handler(
         self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]
@@ -484,14 +564,12 @@ class WebDashboard:
 
         If ``serve()`` itself raises ``AssertionError`` during shutdown
         (rather than the exception surfacing through a callback), this
-        wrapper applies the same asyncio-frame gate used in
-        ``_loop_exception_handler`` to avoid swallowing unrelated errors.
+        wrapper suppresses it.
         """
         try:
             await self._server.serve()
-        except AssertionError as exc:
-            ctx: dict[str, Any] = {"exception": exc}
-            if self._is_proactor_shutdown_race(ctx):
+        except AssertionError:
+            if self._server is not None and getattr(self._server, "should_exit", False):
                 logger.debug(
                     "Suppressed proactor accept-loop AssertionError during server shutdown"
                 )

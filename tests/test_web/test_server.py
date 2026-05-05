@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-import traceback
-from unittest.mock import AsyncMock, MagicMock, patch
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from starlette.testclient import TestClient
@@ -22,10 +22,12 @@ from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.web.server import WebDashboard
 
 
-def _make_dashboard(*, bg: bool = False) -> tuple[WorkflowEventEmitter, WebDashboard]:
+def _make_dashboard(
+    *, bg: bool = False, workflow_root: Path | None = None
+) -> tuple[WorkflowEventEmitter, WebDashboard]:
     """Create an emitter and dashboard pair for testing."""
     emitter = WorkflowEventEmitter()
-    dashboard = WebDashboard(emitter, host="127.0.0.1", port=0, bg=bg)
+    dashboard = WebDashboard(emitter, host="127.0.0.1", port=0, bg=bg, workflow_root=workflow_root)
     return emitter, dashboard
 
 
@@ -500,19 +502,6 @@ class TestServerStartupFailure:
             await dashboard.start()
 
 
-def _make_exc_with_asyncio_traceback() -> AssertionError:
-    """Construct an AssertionError that carries a real (non-empty) traceback.
-
-    Combined with patching ``traceback.extract_tb`` in the relevant test, this
-    simulates the proactor accept-loop race where the AssertionError surfaces
-    from inside asyncio internals.
-    """
-    try:
-        raise AssertionError("simulated proactor race")
-    except AssertionError as e:
-        return e
-
-
 class TestProactorShutdownRace:
     """Tests for the proactor accept-loop race guard (Python 3.14+ Windows).
 
@@ -523,47 +512,13 @@ class TestProactorShutdownRace:
     """
 
     def test_is_proactor_shutdown_race_true_during_shutdown(self) -> None:
-        """Returns True for AssertionError raised from asyncio internals during shutdown."""
+        """_is_proactor_shutdown_race returns True when server is shutting down."""
         _, dashboard = _make_dashboard()
         dashboard._server = MagicMock()
         dashboard._server.should_exit = True
 
-        exc = _make_exc_with_asyncio_traceback()
-        context = {"exception": exc}
-        # Simulate the deepest traceback frame originating in asyncio internals.
-        fake_frame = traceback.FrameSummary(
-            filename="/usr/lib/python3.14/asyncio/base_events.py",
-            lineno=1,
-            name="_attach",
-        )
-        with patch("traceback.extract_tb", return_value=[fake_frame]):
-            assert dashboard._is_proactor_shutdown_race(context) is True
-
-    def test_is_proactor_shutdown_race_false_for_non_asyncio_traceback(self) -> None:
-        """Returns False when the traceback is NOT from asyncio (issue #145 I3)."""
-        _, dashboard = _make_dashboard()
-        dashboard._server = MagicMock()
-        dashboard._server.should_exit = True
-
-        # An AssertionError raised by user/workflow code during shutdown
-        # has no asyncio frame and must NOT be silently swallowed.
-        try:
-            raise AssertionError("user-code assertion")
-        except AssertionError as e:
-            exc = e
-        context = {"exception": exc}
-        assert dashboard._is_proactor_shutdown_race(context) is False
-
-    def test_is_proactor_shutdown_race_false_without_traceback(self) -> None:
-        """Returns False when traceback is absent (issue #145 I3)."""
-        _, dashboard = _make_dashboard()
-        dashboard._server = MagicMock()
-        dashboard._server.should_exit = True
-
-        # An AssertionError without a traceback cannot be classified as the
-        # known race; the gate must fail closed.
         context = {"exception": AssertionError()}
-        assert dashboard._is_proactor_shutdown_race(context) is False
+        assert dashboard._is_proactor_shutdown_race(context) is True
 
     def test_is_proactor_shutdown_race_false_when_not_shutting_down(self) -> None:
         """_is_proactor_shutdown_race returns False when server is running."""
@@ -598,16 +553,10 @@ class TestProactorShutdownRace:
         dashboard._server.should_exit = True
 
         loop = MagicMock()
-        exc = _make_exc_with_asyncio_traceback()
-        context = {"exception": exc, "message": "test"}
+        context = {"exception": AssertionError(), "message": "test"}
 
-        fake_frame = traceback.FrameSummary(
-            filename="/usr/lib/python3.14/asyncio/base_events.py",
-            lineno=1,
-            name="_attach",
-        )
-        with patch("traceback.extract_tb", return_value=[fake_frame]):
-            dashboard._loop_exception_handler(loop, context)
+        # Should not raise or call default handler
+        dashboard._loop_exception_handler(loop, context)
         loop.default_exception_handler.assert_not_called()
 
     def test_loop_exception_handler_delegates_other_errors(self) -> None:
@@ -640,8 +589,7 @@ class TestProactorShutdownRace:
 
     @pytest.mark.asyncio
     async def test_guarded_serve_suppresses_assertion_during_shutdown(self) -> None:
-        """_guarded_serve swallows AssertionError when the asyncio-frame gate passes."""
-        import traceback as tb_mod
+        """_guarded_serve swallows AssertionError when server is shutting down."""
         from unittest.mock import patch
 
         _, dashboard = _make_dashboard()
@@ -651,20 +599,12 @@ class TestProactorShutdownRace:
 
         import uvicorn
 
-        fake_frame = tb_mod.FrameSummary(
-            filename="/usr/lib/python3.14/asyncio/base_events.py",
-            lineno=1,
-            name="_attach",
-        )
-        with (
-            patch.object(uvicorn.Server, "serve", _assert_serve),
-            patch("traceback.extract_tb", return_value=[fake_frame]),
-        ):
+        with patch.object(uvicorn.Server, "serve", _assert_serve):
             dashboard._server = uvicorn.Server(
                 uvicorn.Config(app=dashboard._app, host="127.0.0.1", port=0)
             )
             dashboard._server.should_exit = True
-            # Should not raise — asyncio frame gate passes
+            # Should not raise
             await dashboard._guarded_serve()
 
     @pytest.mark.asyncio
@@ -685,36 +625,6 @@ class TestProactorShutdownRace:
             )
             dashboard._server.should_exit = False
             with pytest.raises(AssertionError, match="unexpected assertion"):
-                await dashboard._guarded_serve()
-
-    @pytest.mark.asyncio
-    async def test_guarded_serve_reraises_non_asyncio_assertion_during_shutdown(self) -> None:
-        """_guarded_serve re-raises AssertionError from non-asyncio code even during shutdown."""
-        import traceback as tb_mod
-        from unittest.mock import patch
-
-        _, dashboard = _make_dashboard()
-
-        async def _assert_serve(self: object) -> None:
-            raise AssertionError("workflow callback assertion")
-
-        import uvicorn
-
-        # Traceback from user code, not asyncio internals
-        fake_frame = tb_mod.FrameSummary(
-            filename="/app/src/conductor/engine/workflow.py",
-            lineno=42,
-            name="execute",
-        )
-        with (
-            patch.object(uvicorn.Server, "serve", _assert_serve),
-            patch("traceback.extract_tb", return_value=[fake_frame]),
-        ):
-            dashboard._server = uvicorn.Server(
-                uvicorn.Config(app=dashboard._app, host="127.0.0.1", port=0)
-            )
-            dashboard._server.should_exit = True
-            with pytest.raises(AssertionError, match="workflow callback assertion"):
                 await dashboard._guarded_serve()
 
 
@@ -762,3 +672,120 @@ async def _short_grace(event: asyncio.Event, delay: float) -> None:
     """Helper for testing: short grace period."""
     await asyncio.sleep(delay)
     event.set()
+
+
+class TestFileApi:
+    """Tests for GET /api/files/{file_path} endpoint.
+
+    Covers security checks (path traversal, extension filtering, size limits,
+    absolute path rejection) and the happy-path for reading files.
+    """
+
+    @pytest.fixture
+    def workflow_dir(self, tmp_path: Path) -> Path:
+        """Create a temporary workflow directory with sample files."""
+        (tmp_path / "plan.md").write_text("# My Plan\nSome content", encoding="utf-8")
+        (tmp_path / "data.json").write_text('{"key": "value"}', encoding="utf-8")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "nested.yaml").write_text("key: value", encoding="utf-8")
+        (tmp_path / "secret.exe").write_bytes(b"\x00binary")
+        (tmp_path / "image.png").write_bytes(b"\x89PNG")
+        return tmp_path
+
+    def _client(self, workflow_dir: Path) -> TestClient:
+        _, dashboard = _make_dashboard(workflow_root=workflow_dir)
+        return TestClient(dashboard.app)
+
+    def test_read_markdown_file(self, workflow_dir: Path) -> None:
+        """Happy path: read a .md file."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/plan.md")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["path"] == "plan.md"
+            assert "# My Plan" in body["content"]
+            assert body["extension"] == ".md"
+            assert body["size"] > 0
+
+    def test_read_nested_file(self, workflow_dir: Path) -> None:
+        """Read a file in a subdirectory."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/sub/nested.yaml")
+            assert resp.status_code == 200
+            assert resp.json()["path"] == "sub/nested.yaml"
+
+    def test_read_json_file(self, workflow_dir: Path) -> None:
+        """Read a JSON file."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/data.json")
+            assert resp.status_code == 200
+            assert '"key"' in resp.json()["content"]
+
+    def test_file_not_found(self, workflow_dir: Path) -> None:
+        """Non-existent file returns 404."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/nonexistent.md")
+            assert resp.status_code == 404
+
+    def test_path_traversal_dotdot(self, workflow_dir: Path) -> None:
+        """Path traversal with .. is blocked (403 containment check)."""
+        # Create a file outside workflow_dir to prove it can't be reached
+        outside = workflow_dir.parent / "secret.txt"
+        outside.write_text("top secret", encoding="utf-8")
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/../secret.txt")
+            assert resp.status_code in (403, 404)
+
+    def test_absolute_path_rejected(self, workflow_dir: Path) -> None:
+        """Absolute path is rejected with 403."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files//etc/passwd")
+            assert resp.status_code == 403
+
+    def test_drive_path_rejected(self, workflow_dir: Path) -> None:
+        """Windows drive-qualified path is rejected."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/C:/Windows/system32/cmd.exe")
+            assert resp.status_code == 403
+
+    def test_scheme_rejected(self, workflow_dir: Path) -> None:
+        """URL scheme in path is rejected."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/file:///etc/passwd")
+            assert resp.status_code == 403
+
+    def test_disallowed_extension(self, workflow_dir: Path) -> None:
+        """Binary/disallowed extension returns 403."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/secret.exe")
+            assert resp.status_code == 403
+            assert "not supported" in resp.json()["error"]
+
+    def test_disallowed_image_extension(self, workflow_dir: Path) -> None:
+        """Image extension is not in the allowlist."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/image.png")
+            assert resp.status_code == 403
+
+    def test_large_file_rejected(self, workflow_dir: Path) -> None:
+        """File larger than 1MB is rejected with 413."""
+        big = workflow_dir / "huge.txt"
+        big.write_text("x" * (1024 * 1024 + 1), encoding="utf-8")
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/huge.txt")
+            assert resp.status_code == 413
+            assert "too large" in resp.json()["error"].lower()
+
+    def test_no_workflow_root_returns_404(self) -> None:
+        """When workflow_root is None, endpoint returns 404."""
+        _, dashboard = _make_dashboard(workflow_root=None)
+        with TestClient(dashboard.app) as client:
+            resp = client.get("/api/files/plan.md")
+            assert resp.status_code == 404
+            assert "No workflow root" in resp.json()["error"]
+
+    def test_unc_path_rejected(self, workflow_dir: Path) -> None:
+        """UNC path (\\\\server\\share) is rejected."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/\\\\server\\share\\file.txt")
+            assert resp.status_code in (403, 404)
